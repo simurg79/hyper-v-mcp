@@ -1,0 +1,44 @@
+# .NET
+bin/
+obj/
+*.user
+*.suo
+*.cache
+*.dll
+*.exe
+*.pdb
+
+# IDE
+.vs/
+.vscode/
+*.swp
+*~
+
+# Build output
+publish/
+artifacts/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Logs
+*.log
+
+# Temp files
+*.tmp
+pr-body.md
+
+# Roo vault symlinks and backups
+.roo
+.roomodes
+.clinerules
+.roo_backup_*
+.roomodes.backup_*
+myplans
+
+# One-off diagnostic capture files (v10 cohort)
+Parent
+rc10-run-output.txt
+myscripts

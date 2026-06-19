@@ -1,0 +1,116 @@
+name: CI (Hyper-V)
+
+# Runs the test categories that REQUIRE a real Hyper-V host:
+#   - Category=RequiresHyperV
+#   - Category=LiveE2E (opt-in via input)
+#
+# Requires a self-hosted runner registered with the labels:
+#   [self-hosted, windows, hyperv]
+#
+# The runner host must have:
+#   - Hyper-V role enabled (Get-VM available)
+#   - .NET 8 SDK installed (or installable)
+#   - PowerShell 7+ available
+#   - Lab fixtures per the operator-local vault doc myplans/operational/lab-environment.md (not tracked in this repo)
+#
+# This workflow is intentionally NOT triggered on every PR. It runs:
+#   - Manually via workflow_dispatch
+#   - Nightly on a schedule (skip when no commits — see job condition)
+
+on:
+  workflow_dispatch:
+    inputs:
+      include_live_e2e:
+        description: 'Also run Category=LiveE2E (slow, requires base VHDX & lab credentials)'
+        type: boolean
+        default: false
+  schedule:
+    # 09:00 UTC daily — adjust as needed.
+    - cron: '0 9 * * *'
+
+permissions:
+  contents: read
+  checks: write
+
+concurrency:
+  # Only one Hyper-V run at a time per ref to avoid lab contention.
+  group: ci-hyperv-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  CONFIGURATION: Release
+
+jobs:
+  hyperv-tests:
+    name: Hyper-V tests (self-hosted)
+    runs-on: [self-hosted, windows, hyperv]
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Verify Hyper-V availability
+        shell: pwsh
+        run: |
+          $vmCmd = Get-Command Get-VM -ErrorAction SilentlyContinue
+          if (-not $vmCmd) {
+            Write-Error "Get-VM cmdlet not found — Hyper-V module is not installed on this runner."
+            exit 1
+          }
+          Get-VMHost | Format-List Name, VirtualHardDiskPath, VirtualMachinePath
+
+      - name: Restore
+        run: dotnet restore HyperV.Mcp.Server.sln
+
+      - name: Build
+        run: dotnet build HyperV.Mcp.Server.sln --configuration ${{ env.CONFIGURATION }} --no-restore
+
+      - name: Compute test filter
+        id: filter
+        shell: pwsh
+        run: |
+          $includeLive = '${{ github.event.inputs.include_live_e2e }}' -eq 'true'
+          if ($includeLive) {
+            $filter = 'Category=RequiresHyperV|Category=LiveE2E'
+          } else {
+            $filter = 'Category=RequiresHyperV'
+          }
+          "filter=$filter" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Test filter: $filter"
+
+      - name: Test (Hyper-V categories)
+        run: >
+          dotnet test HyperV.Mcp.Server.sln
+          --configuration ${{ env.CONFIGURATION }}
+          --no-build
+          --filter "${{ steps.filter.outputs.filter }}"
+          --logger "trx;LogFileName=test-results-hyperv.trx"
+          --logger "GitHubActions;summary.includePassedTests=false"
+          --results-directory ${{ github.workspace }}/TestResults
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-hyperv
+          path: ${{ github.workspace }}/TestResults/**/*
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Publish test report
+        if: always()
+        uses: dorny/test-reporter@v1
+        with:
+          name: Hyper-V test results
+          path: ${{ github.workspace }}/TestResults/**/test-results-hyperv.trx
+          reporter: dotnet-trx
+          fail-on-error: false

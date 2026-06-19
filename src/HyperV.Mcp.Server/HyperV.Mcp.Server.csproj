@@ -1,0 +1,54 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>HyperV.Mcp.Server</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="ModelContextProtocol" Version="0.2.0-preview.1" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.1" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="8.0.1" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Binder" Version="8.0.2" />
+    <!-- Phase 2 (issue #52): in-process PowerShell SDK runspace for IPowerShellHost.
+         See /myplans/remoting/powershell-direct/powershell-direct-design.md — PSD-D5. -->
+    <PackageReference Include="Microsoft.PowerShell.SDK" Version="7.4.6" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="HyperV.Mcp.Server.Tests" />
+  </ItemGroup>
+
+  <!-- RC-10.3b Layer B: Strip the bundled Microsoft.PowerShell.Security module from output.
+       The PS SDK ships an unsigned copy of Microsoft.PowerShell.Security under
+       runtimes\win\lib\netX.X\Modules\Microsoft.PowerShell.Security\. When PSModulePath
+       includes that path (the SDK re-injects it after runspace open, defeating RC-10.2
+       AugmentPsModulePath), AuthorizationManager rejects the unsigned Security.types.ps1xml
+       under Code Integrity / catalog signing policy, surfacing as CommandNotFoundException
+       for cmdlets like ConvertTo-SecureString during New-PSSession -Credential binding
+       (FQEID=CouldNotAutoloadMatchingModule, RC-10.3-meta smoking gun).
+       The trusted, signed copy under C:\Program Files\PowerShell\7\Modules\ (PS7) or
+       C:\Windows\System32\WindowsPowerShell\v1.0\Modules\ (PS5.1) is the only one we want
+       loaded at runtime.
+       SCOPE: Microsoft.PowerShell.Security ONLY. We MUST NOT strip Microsoft.PowerShell.Utility
+       (Select-Object), .Management, .Diagnostics, .Host, .Archive — the in-proc PS7 (Core)
+       runspace requires these bin-local copies; the system Desktop-edition copies are
+       Core-incompatible. Stripping them broke the Get-VMHost startup probe (issue #66).
+       Do NOT broaden this include back to Microsoft.PowerShell.* — fix #66 regression. -->
+  <Target Name="StripBundledMicrosoftPowerShellModules" AfterTargets="Build;Publish">
+    <ItemGroup>
+      <_BundledMsPSSecurity Include="$(OutDir)runtimes\win\lib\net*\Modules\Microsoft.PowerShell.Security\**\*" />
+      <_BundledMsPSSecurityPub Include="$(PublishDir)runtimes\win\lib\net*\Modules\Microsoft.PowerShell.Security\**\*"
+                               Condition=" '$(PublishDir)' != '' " />
+    </ItemGroup>
+    <Delete Files="@(_BundledMsPSSecurity)" />
+    <Delete Files="@(_BundledMsPSSecurityPub)" Condition=" '$(PublishDir)' != '' " />
+    <RemoveDir Directories="@(_BundledMsPSSecurity->'%(RootDir)%(Directory)')" />
+    <RemoveDir Directories="@(_BundledMsPSSecurityPub->'%(RootDir)%(Directory)')" Condition=" '$(PublishDir)' != '' " />
+    <Message Importance="high" Text="RC-10.3b: Stripped bundled Microsoft.PowerShell.Security from $(OutDir) and $(PublishDir)." />
+  </Target>
+
+</Project>
