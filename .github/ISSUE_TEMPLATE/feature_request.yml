@@ -1,0 +1,53 @@
+name: Feature request
+description: Suggest an enhancement or new capability for the Hyper-V MCP Server.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting an improvement.
+
+        Please search existing issues and feature requests first to avoid
+        duplicates. For anything security-related, follow our
+        [security policy](../blob/main/SECURITY.md) instead of opening a
+        public issue.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: >-
+        What problem are you trying to solve? Describe the use case and why the
+        current behavior is insufficient.
+    validations:
+      required: true
+  - type: textarea
+    id: proposed-solution
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior or capability you would like to see.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Any alternative solutions or workarounds you have considered.
+    validations:
+      required: false
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Any other context, references, or screenshots.
+    validations:
+      required: false
+  - type: checkboxes
+    id: acknowledgements
+    attributes:
+      label: Acknowledgements
+      options:
+        - label: >-
+            I searched existing issues and feature requests and did not find a
+            duplicate.
+          required: true

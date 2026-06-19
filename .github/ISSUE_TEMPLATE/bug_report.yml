@@ -1,0 +1,98 @@
+name: Bug report
+description: Report a reproducible problem with the Hyper-V MCP Server.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report.
+
+        **Do not report security vulnerabilities here.** For anything
+        security-related, follow our
+        [security policy](../blob/main/SECURITY.md) and use GitHub's private
+        vulnerability reporting (the repository's **Security** tab →
+        **Report a vulnerability**) instead of opening a public issue.
+
+        Please search existing issues first to avoid duplicates.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug and its impact.
+      placeholder: Describe what went wrong.
+    validations:
+      required: true
+  - type: textarea
+    id: steps-to-reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Minimal, deterministic steps that trigger the problem.
+      placeholder: |
+        1. Configure '...'
+        2. Call tool '...' with '...'
+        3. Observe '...'
+    validations:
+      required: true
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: Expected behavior
+      description: What you expected to happen instead.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Please provide as much detail as you can.
+      value: |
+        - Windows edition / build:
+        - .NET SDK version (`dotnet --version`):
+        - PowerShell (pwsh 7+ or Windows PowerShell 5.1):
+        - Running elevated (administrator)? (yes / no):
+        - MCP client (name and version):
+    validations:
+      required: true
+  - type: input
+    id: server-version
+    attributes:
+      label: Server version / commit
+      description: The release tag or commit SHA you are running.
+      placeholder: e.g. v0.1.0 or commit abc1234
+    validations:
+      required: true
+  - type: dropdown
+    id: affected-tool
+    attributes:
+      label: Affected tool(s)
+      description: Optional — the tool most relevant to this bug, if any.
+      multiple: true
+      options:
+        - vm_create
+        - vm_run_command
+        - vm_copy_file
+        - vm_os_install
+        - vm_checkpoint
+        - Other / unsure
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs / MCP error envelope
+      description: Paste any relevant log output or the MCP error envelope.
+      render: text
+    validations:
+      required: false
+  - type: checkboxes
+    id: acknowledgements
+    attributes:
+      label: Acknowledgements
+      options:
+        - label: I searched existing issues and did not find a duplicate.
+          required: true
+        - label: >-
+            This is not a security report. (Security issues go through the
+            Security tab per SECURITY.md, not public issues.)
+          required: true
