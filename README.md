@@ -195,10 +195,6 @@ The full activation, masking, and security contract — including a recommended 
 
 > For operational failure modes (timeouts, partially-created resources, transient PowerShell faults), the troubleshooting guide was relocated to the operator-local roo-vault at `myplans/operational/troubleshooting.md` (not tracked in this repo). This table tracks build/OS-level known issues only.
 
-## Documentation Map
-
-Design memory, implementation plans, and architectural decision records are maintained in a separate internal vault and are not part of this public repository. The source tree is the primary reference: each tool handler under `src/HyperV.Mcp.Server/` carries inline contract notes, and the test suite under `tests/` codifies the expected MCP behavior contract.
-
 ## License
 
 Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for the full license text.
