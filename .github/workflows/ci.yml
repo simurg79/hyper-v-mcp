@@ -1,0 +1,75 @@
+name: CI
+
+# Fast, host-independent build + test gate for every push and pull request.
+#
+# Runs the test categories that do NOT require a real Hyper-V host — that is,
+# everything EXCEPT:
+#   - Category=RequiresHyperV
+#   - Category=LiveE2E
+#
+# Those host-dependent categories run separately in ci-hyperv.yml on a
+# self-hosted Hyper-V runner. The filter below mirrors the command documented
+# in .github/PULL_REQUEST_TEMPLATE.md.
+#
+# The project targets net8.0-windows, so the build and tests must run on a
+# Windows runner.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  CONFIGURATION: Release
+
+jobs:
+  build-test:
+    name: Build & host-independent tests
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: dotnet restore HyperV.Mcp.Server.sln
+
+      - name: Build
+        run: dotnet build HyperV.Mcp.Server.sln --configuration ${{ env.CONFIGURATION }} --no-restore
+
+      - name: Test (host-independent categories)
+        run: >
+          dotnet test HyperV.Mcp.Server.sln
+          --configuration ${{ env.CONFIGURATION }}
+          --no-build
+          --filter "Category!=RequiresHyperV&Category!=LiveE2E"
+          --logger "trx;LogFileName=test-results.trx"
+          --logger "GitHubActions;summary.includePassedTests=false"
+          --results-directory ${{ github.workspace }}/TestResults
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: ${{ github.workspace }}/TestResults/**/*
+          if-no-files-found: warn
+          retention-days: 14
