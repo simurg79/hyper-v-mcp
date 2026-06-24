@@ -108,7 +108,7 @@ jobs:
 
       - name: Publish test report
         if: always()
-        uses: dorny/test-reporter@v1
+        uses: dorny/test-reporter@v3
         with:
           name: Hyper-V test results
           path: ${{ github.workspace }}/TestResults/**/test-results-hyperv.trx
