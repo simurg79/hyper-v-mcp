@@ -17,6 +17,7 @@
     <!-- Phase 2 (issue #52): in-process PowerShell SDK runspace for IPowerShellHost.
          See /myplans/remoting/powershell-direct/powershell-direct-design.md — PSD-D5. -->
     <PackageReference Include="Microsoft.PowerShell.SDK" Version="7.4.6" />
+    <PackageReference Include="System.ServiceProcess.ServiceController" Version="10.0.9" />
   </ItemGroup>
 
   <ItemGroup>
