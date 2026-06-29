@@ -7,6 +7,12 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
+    # Microsoft.PowerShell.SDK minor bumps are NOT low-risk: each PS 7.x minor
+    # targets a different .NET version (7.4→net8, 7.5→net9, 7.6→net10), so a
+    # minor bump requires a TFM upgrade and must be handled manually.
+    ignore:
+      - dependency-name: "Microsoft.PowerShell.SDK"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
     groups:
       # Batch low-risk minor/patch bumps into a single PR to cut noise.
       # Major upgrades still arrive as individual PRs for closer review.
