@@ -21,7 +21,7 @@
     <PackageReference Include="System.ServiceProcess.ServiceController" Version="8.0.1" />
     <!-- Provides the "GitHubActions" test logger used by the CI workflows
          (.github/workflows/ci.yml and ci-hyperv.yml) for inline test annotations. -->
-    <PackageReference Include="GitHubActionsTestLogger" Version="2.4.1" />
+    <PackageReference Include="GitHubActionsTestLogger" Version="3.0.4" />
   </ItemGroup>
 
   <ItemGroup>
