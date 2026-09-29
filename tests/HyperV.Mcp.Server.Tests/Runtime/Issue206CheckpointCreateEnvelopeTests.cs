@@ -289,34 +289,45 @@ public class Issue206CheckpointCreateEnvelopeTests
         stdout.Should().NotContain("WARNING:", "VC-CE-D6 removes the duplicate-name Write-Warning");
     }
 
-    // --- T7: real powershell.exe regression — gated by env --------------------
+    // --- T7: real powershell.exe regression — now implemented elsewhere -------
 
+    /// <summary>
+    /// The real (non-mocked) <c>Checkpoint-VM</c> regression that this slot reserved is
+    /// now implemented as a first-class test in
+    /// <see cref="Issue125CheckpointVmRealExecutorRegressionTests"/> (Issue #125 / CPF-D7):
+    ///   • a selection assertion that the real <see cref="PowerShellExecutor"/> resolves
+    ///     <c>Checkpoint-VM</c> parameter metadata under <c>-NonInteractive</c> (runs on any
+    ///     Hyper-V host, no VM), and
+    ///   • an env-gated (<c>HYPERV_MCP_RUN_REAL_PS=1</c> + <c>HYPERV_MCP_TEST_VM_ID</c>)
+    ///     real create→delete round-trip on a disposable test VM with guaranteed cleanup.
+    /// This closes the KG-3 live-vs-unit gap the #206 mocked executor could not cover.
+    /// This residual marker simply asserts the live tier remains OFF by default so the
+    /// mocked #206 suite never spawns a real interpreter.
+    /// </summary>
     [Fact]
     [Trait("Category", "RealPowerShell")]
-    public void T7_RealPowerShell_RegressionPlaceholder()
+    public void T7_RealPowerShell_RegressionMovedToIssue125Suite()
     {
-        // Real powershell.exe execution requires Hyper-V on the host. The smoke-test
-        // and live-integration suites cover this; here we document the slot.
-        // If $env:HYPERV_MCP_RUN_REAL_PS == "1" AND Hyper-V is available, the
-        // intended behavior is to instantiate a real PowerShellExecutor and call
-        // CreateCheckpointAsync against a test VM, asserting no NRE leaks out and
-        // envelope is success:true. Skipped by default.
+        // The live tier is opt-in ONLY on the exact literal "1"; every other value (unset,
+        // "0", or CI's common "false") leaves it OFF. Keying off "1" — rather than treating
+        // any non-"0" value as enabled — avoids a spurious failure when HYPERV_MCP_RUN_REAL_PS=false.
         var enable = Environment.GetEnvironmentVariable("HYPERV_MCP_RUN_REAL_PS");
-        Assert.True(string.IsNullOrEmpty(enable) || enable == "0",
-            "Real-PowerShell regression for #206 is exercised by the live integration suite.");
+        Assert.True(enable != "1",
+            "Real-PowerShell Checkpoint-VM regression now lives in Issue125CheckpointVmRealExecutorRegressionTests; " +
+            "the mocked #206 suite stays mock-only by default.");
     }
 
     // --- T8: parser unit (happy path with create validator) -------------------
 
     [Fact]
-    public void T8_ParseCheckpointResult_Happy_CreatePayload()
+    public async Task T8_ParseCheckpointResult_Happy_CreatePayload()
     {
         // Direct parser unit test via the public create flow (parser is private).
         var realJson = CreateSuccessJson("cp1", "aaaaaaaa-bbbb-cccc-dddd-444444444444");
         var noisy = "WARNING: duplicate name\n" + realJson + "\ntrailing junk\n";
         SequenceExecutor(Ok(PreIdsJson()), Ok(noisy));
 
-        var result = _manager.CreateCheckpointAsync(LocalHostId, TestVmId, "cp1").GetAwaiter().GetResult();
+        var result = await _manager.CreateCheckpointAsync(LocalHostId, TestVmId, "cp1");
 
         result.Action.Should().Be("create");
         result.CheckpointName.Should().Be("cp1");

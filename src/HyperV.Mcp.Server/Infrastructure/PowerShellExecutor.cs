@@ -61,7 +61,28 @@ public class PowerShellExecutor : IPowerShellExecutor
     internal string ExecutablePath => _psExecutable;
 
     /// <inheritdoc />
-    public async Task<PowerShellResult> ExecuteAsync(string script, int timeoutSeconds = 300, CancellationToken ct = default, bool allowDump = true)
+    public Task<PowerShellResult> ExecuteAsync(string script, int timeoutSeconds = 300, CancellationToken ct = default, bool allowDump = true)
+        => ExecuteCoreAsync(script, secretEnvironment: null, timeoutSeconds, ct, allowDump);
+
+    /// <inheritdoc />
+    public Task<PowerShellResult> ExecuteWithSecretsAsync(
+        string script,
+        IReadOnlyDictionary<string, string> secretEnvironment,
+        int timeoutSeconds = 300,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(secretEnvironment);
+        // allowDump is forced off: a dump of this script would be pointless (it holds no secret)
+        // but preserving the temp file would extend the lifetime of the process that holds one.
+        return ExecuteCoreAsync(script, secretEnvironment, timeoutSeconds, ct, allowDump: false);
+    }
+
+    private async Task<PowerShellResult> ExecuteCoreAsync(
+        string script,
+        IReadOnlyDictionary<string, string>? secretEnvironment,
+        int timeoutSeconds,
+        CancellationToken ct,
+        bool allowDump)
     {
         if (string.IsNullOrWhiteSpace(script))
             throw new ArgumentException("Script cannot be null or empty.", nameof(script));
@@ -176,6 +197,17 @@ public class PowerShellExecutor : IPowerShellExecutor
             // See also: StripAnsiEscapeCodes() for defense-in-depth output sanitization.
             psi.Environment["NO_COLOR"] = "1";
             psi.Environment["TERM"] = "dumb";
+
+            // Secrets travel in the child's environment block, never in the temp .ps1 file, so a
+            // crash cannot leave them readable on the host disk.
+            // See myplans/vm-management/vm-create/vm-create-admin-password-spec.md — FR-14 / FR-16.
+            if (secretEnvironment is not null)
+            {
+                foreach (var entry in secretEnvironment)
+                {
+                    psi.Environment[entry.Key] = entry.Value;
+                }
+            }
 
             using var process = new Process { StartInfo = psi };
 
@@ -396,34 +428,44 @@ public class PowerShellExecutor : IPowerShellExecutor
     /// See /myplans/remoting/remoting-design.md — Assumption #1: pwsh.exe preferred when compatible.
     /// See /myplans/execution/execution-design.md — EX-D6: Async stderr/stdout handling in process probes.
     ///
-    /// NOTE: pwsh (PS 7+) has a known bug where Get-VM throws "Value cannot be null"
-    /// when spawned non-interactively, even after Import-Module Hyper-V succeeds.
-    /// Checking module availability alone is insufficient — we must actually run Get-VM
-    /// to confirm it works. powershell.exe (5.1) does not have this issue.
+    /// NOTE: pwsh (PS 7+) has a known bug where Hyper-V cmdlets throw "Value cannot be
+    /// null" when spawned non-interactively, even after Import-Module Hyper-V succeeds.
+    /// Checking module availability alone is insufficient — we must actually run the
+    /// cmdlets to confirm they work. powershell.exe (5.1) does not have this issue.
+    ///
+    /// Issue #125 / CPF-D3 + CPF-D4: the probe must represent the cmdlet that actually
+    /// fails, so it also resolves Checkpoint-VM parameter metadata, not Get-VM alone. A
+    /// host where Get-VM works under pwsh can still hit the PS7 non-interactive bug on
+    /// Checkpoint-VM (the #125 live failure); the representative probe reproduces that
+    /// WITHOUT touching a real checkpoint, so an unsuitable host falls back to 5.1.
+    /// Scope (OQ-2 / Constraint 5): narrowest change — pwsh is still chosen when it
+    /// handles the cmdlet path; the in-process PSD-D9/PSD-D10 runspace is untouched.
+    /// See /myplans/vm-management/checkpoints/vm-checkpoint-failed-diagnosability-design.md.
     /// </summary>
     private string DetectPowerShell()
     {
-        // Phase 1: Test pwsh with actual Get-VM execution (not just module availability).
-        // pwsh (PS 7+) has a known issue where Get-VM throws "Value cannot be null"
-        // when spawned non-interactively, even though the Hyper-V module is available.
+        // Phase 1: probe pwsh with real Hyper-V cmdlet execution (not just module
+        // availability). The probe exercises BOTH Get-VM AND a Checkpoint-VM-representative
+        // metadata resolution (CPF-D3) so selection predicts the cmdlet that runs for #125.
         try
         {
             var (exitCode, output) = RunProbe(
                 "pwsh",
-                "-NoProfile -NonInteractive -Command \"Import-Module Hyper-V -ErrorAction Stop; try { Get-VM -ErrorAction Stop | Out-Null } catch { if ($_.Exception.Message -match 'cannot be null') { exit 2 } else { exit 1 } }; Write-Output 'HyperV-OK'\"",
+                "-NoProfile -NonInteractive -Command \"Import-Module Hyper-V -ErrorAction Stop; try { Get-VM -ErrorAction Stop | Out-Null; Get-Command Checkpoint-VM -ErrorAction Stop | ForEach-Object { $_.Parameters['SnapshotName'] | Out-Null } } catch { if ($_.Exception.Message -match 'cannot be null') { exit 2 } else { exit 1 } }; Write-Output 'HyperV-OK'\"",
                 timeoutSeconds: 15);
 
             if (exitCode == 0 && output.Contains("HyperV-OK"))
             {
-                _logger.LogInformation("pwsh.exe detected with working Hyper-V cmdlets.");
+                _logger.LogInformation("pwsh.exe detected with working Hyper-V cmdlets (incl. Checkpoint-VM probe).");
                 return "pwsh";
             }
 
             if (exitCode == 2)
             {
                 _logger.LogWarning(
-                    "pwsh.exe has Hyper-V module but Get-VM throws 'Value cannot be null' " +
-                    "(known PS7 non-interactive bug). Falling back to powershell.exe (5.1).");
+                    "pwsh.exe has Hyper-V module but a Hyper-V cmdlet throws 'Value cannot be null' " +
+                    "(known PS7 non-interactive bug; Checkpoint-VM-representative probe). " +
+                    "Falling back to powershell.exe (5.1).");
             }
             else
             {

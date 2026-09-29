@@ -2,36 +2,23 @@ using HyperV.Mcp.Server.Models;
 
 namespace HyperV.Mcp.Server.Infrastructure;
 
-/// <summary>
-/// High-level VM lifecycle operations.
-/// See /myplans/vm-management/vm-management-design.md — Interfaces: Provided.
-/// </summary>
 public interface IHyperVManager
 {
-    /// <summary>
-    /// Create a new VM from a base VHDX. When <paramref name="autoStart"/> is true,
-    /// the VM is started after creation; when false (default), it remains in Off state.
-    /// See /myplans/vm-management/lifecycle/lifecycle-design.md.
-    /// <para>
-    /// <paramref name="verifyBaseImageHash"/> (Issue #169 / VC-D6, VC-D8, ADR-4):
-    /// when <see langword="true"/> (default) the warm-on-init / ST-D6a SHA-256 cache
-    /// supplies the pre-hash and the post-create SHA-256 is unconditionally
-    /// force-recomputed via <see cref="IBaseImageHashCache.ForceRecomputeAsync"/>;
-    /// any mismatch surfaces as <c>BASE_IMAGE_MUTATED</c>. When <see langword="false"/>
-    /// both the pre-hash lookup AND the post-create recompute are skipped — the
-    /// guard collapses to ReadOnly-attribute-only (the legacy
-    /// <c>baseImageHashCache==null</c> code path). The opt-out is an
-    /// operator-accepted ADR-4 trade-off documented on the <c>vm_create</c> tool
-    /// description; it is NOT a transport-timeout knob.
-    /// </para>
-    /// </summary>
+    /// <summary>Creates a VM; autoStart=true starts it, otherwise it remains Off (default).
+    /// verifyBaseImageHash=true uses the warm pre-hash and unconditionally force-recomputes the post-hash; mismatches yield BASE_IMAGE_MUTATED.
+    /// False skips both hashes, leaving the legacy null-cache ReadOnly-only guard: an operator-accepted correctness trade-off, not a transport-timeout knob.</summary>
     Task<VmInfo> CreateVmAsync(string hostId, string name, string? baseVhdxPath,
         int cpuCount, long memoryMB, bool autoStart,
         bool verifyBaseImageHash, CancellationToken ct);
 
-    /// <summary>
-    /// Start a stopped VM.
-    /// </summary>
+    /// <summary>Null adminPassword uses the no-password overload; empty/whitespace values fail with INVALID_PARAMETER.
+    /// A supplied password requires a generalized image, forces startup and returns success only when the guest accepts it;
+    /// readiness uses createTimeBudgetSeconds with a 150s floor. Separate arity preserves Moq expression-tree setups, which cannot bind optional arguments.</summary>
+    Task<VmInfo> CreateVmAsync(string hostId, string name, string? baseVhdxPath,
+        int cpuCount, long memoryMB, bool autoStart,
+        bool verifyBaseImageHash, string? adminPassword, int createTimeBudgetSeconds,
+        CancellationToken ct);
+
     Task<VmInfo> StartVmAsync(string hostId, string vmId, CancellationToken ct = default);
 
     /// <summary>
@@ -45,27 +32,16 @@ public interface IHyperVManager
     /// </summary>
     Task DestroyVmAsync(string hostId, string vmId, CancellationToken ct = default);
 
-    /// <summary>
-    /// List VMs on a host with optional filtering.
-    /// </summary>
     Task<IReadOnlyList<VmInfo>> ListVmsAsync(string hostId, string? nameFilter = null,
         CancellationToken ct = default);
 
-    /// <summary>
-    /// Get detailed status for a specific VM.
-    /// </summary>
+    Task<IReadOnlyList<VmInfo>> FindVmsByNameAsync(string hostId, string name, bool caseSensitive,
+        CancellationToken ct = default);
+
     Task<VmInfo> GetVmStatusAsync(string hostId, string vmId, CancellationToken ct = default);
 
-    /// <summary>
-    /// List available base VHDX images on a host.
-    /// Returns an <see cref="ImageListResult"/> envelope per ST-D7: when no image
-    /// directory source is configured, the call returns success with
-    /// <c>Configured=false</c> and an empty list (not an error). When a configured
-    /// path does not exist, throws <see cref="ArgumentException"/> (→ INVALID_PARAMETER).
-    /// When the path exists but enumeration fails (ACL/IO), throws
-    /// <see cref="IoOperationFailedException"/> (→ IO_ERROR).
-    /// See /myplans/vm-management/storage/storage-design.md — ST-D7.
-    /// </summary>
+    /// <summary>Lists base VHDXs; no configured directory returns Configured=false and an empty list, not an error.
+    /// A missing configured path throws ArgumentException (INVALID_PARAMETER); ACL/IO enumeration failures throw IoOperationFailedException (IO_ERROR).</summary>
     Task<ImageListResult> ListImagesAsync(string hostId, CancellationToken ct = default);
 
     /// <summary>
@@ -74,7 +50,9 @@ public interface IHyperVManager
     Task<VmInfo> RestartVmAsync(string hostId, string vmId, CancellationToken ct = default);
 
     /// <summary>
-    /// Pause a running VM (Suspend-VM). VM must be in Running state.
+    /// Pause a running VM into in-memory <c>Paused</c>. VM must be Running. Success is reported
+    /// only when the VM settles into <c>Paused</c>; <c>Saved</c>/<c>Off</c> or a timeout is a
+    /// caller-facing failure.
     /// </summary>
     Task<VmInfo> PauseVmAsync(string hostId, string vmId, CancellationToken ct = default);
 
@@ -89,21 +67,22 @@ public interface IHyperVManager
     /// </summary>
     Task<VmInfo> ConfigureVmAsync(string hostId, string vmId, int? cpuCount, long? memoryMB, CancellationToken ct);
 
-    /// <summary>
-    /// Wait for a VM to reach a ready state (Running + heartbeat).
-    /// See /myplans/vm-management/lifecycle/lifecycle-design.md — Readiness Probes.
-    /// </summary>
     Task<VmInfo> WaitForReadyAsync(string hostId, string vmId, int timeoutSeconds = 300, CancellationToken ct = default);
 
+    Task<VmInfo> WaitForReadyAsync(string hostId, string vmId, ReadinessBudget budget,
+        string? username = null, string? password = null, CancellationToken ct = default);
+
     /// <summary>
-    /// Find and optionally destroy orphaned VMs (VMs tagged with hyper-v-mcp that have been
-    /// running for more than 24 hours or are in a failed state).
+    /// Find and optionally destroy MCP-owned ephemeral VMs whose recorded creation time is older
+    /// than the 24h cutoff. Classification uses ownership, the ephemeral marker, and age only
+    /// never power state (#93).
     /// </summary>
     Task<IReadOnlyList<VmInfo>> CleanupOrphansAsync(string hostId, bool dryRun = true, CancellationToken ct = default);
 
     /// <summary>
     /// Install OS from ISO image — creates VM, installs OS via unattended setup, bootstraps to ready.
-    /// See /myplans/vm-management/iso-installation/iso-installation-design.md.
+    /// Supports Windows and Ubuntu Server 24.04. <paramref name="guestUsername"/>
+    /// is the initial Ubuntu login user (default <c>ubuntu</c>) and is ignored for the Windows target.
     /// </summary>
     Task<OsInstallResult> OsInstallAsync(
         string hostId,
@@ -119,14 +98,12 @@ public interface IHyperVManager
         string? productKey = null,
         int timeoutMinutes = 60,
         bool skipPreflight = false,
+        string? guestUsername = null,
         CancellationToken ct = default);
 
-    /// <summary>
-    /// Issue #51: Returns the host-side absolute path to the primary VHDX attached
-    /// to the named VM via <c>Get-VMHardDiskDrive | Select-Object -First 1</c>.
-    /// Throws <see cref="VmNotFoundException"/> when the VM does not exist;
-    /// throws <see cref="InvalidOperationException"/> when the VM has no attached
-    /// VHDX. Used by <c>vm_create_base_image</c> to locate the disk to copy.
-    /// </summary>
+    /// <summary> Returns the host-side absolute path to the primary VHDX attached to the named VM via
+    /// <c>Get-VMHardDiskDrive | Select-Object -First 1</c>. Throws <see cref="VmNotFoundException"/> when the VM does
+    /// not exist; throws <see cref="InvalidOperationException"/> when the VM has no attached VHDX. Used by
+    /// <c>vm_create_base_image</c> to locate the disk to copy. </summary>
     Task<string> GetPrimaryVhdxPathAsync(string hostId, string vmName, CancellationToken ct = default);
 }

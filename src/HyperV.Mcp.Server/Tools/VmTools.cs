@@ -4,25 +4,11 @@ using HyperV.Mcp.Server.Infrastructure;
 
 namespace HyperV.Mcp.Server.Tools;
 
-/// <summary>
-/// MCP SDK tool wrappers that bridge attribute-based tool discovery to the internal
-/// <see cref="IToolDispatcher"/>. Each method is discovered by the MCP SDK via
-/// <see cref="McpServerToolTypeAttribute"/> / <see cref="McpServerToolAttribute"/>
-/// and delegates to <see cref="IToolDispatcher.DispatchAsync"/> for actual execution.
-///
-/// This class is the sole integration point between the MCP SDK's tool discovery
-/// mechanism and the internal tool dispatch pipeline. All concurrency control,
-/// argument validation, error mapping, and service delegation happen inside
-/// ToolDispatcher — these wrappers are thin pass-through shims.
-///
-/// See /myplans/mcp-interface/mcp-interface-design.md — MCP-D1: Attribute-based tool registration.
-/// </summary>
+/// <summary>The sole bridge from MCP attribute discovery to IToolDispatcher.
+/// Wrappers only forward calls; the dispatcher owns concurrency, validation, error mapping and service delegation.</summary>
 [McpServerToolType]
 public static class VmTools
 {
-    // ═══════════════════════════════════════════════════════════════════
-    // Health
-    // ═══════════════════════════════════════════════════════════════════
 
     [McpServerTool(Name = "vm_echo"), Description("Echo message back — health check")]
     public static async Task<string> VmEcho(
@@ -41,9 +27,6 @@ public static class VmTools
         return await dispatcher.DispatchAsync("vm_diag", ct);
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // Lifecycle
-    // ═══════════════════════════════════════════════════════════════════
 
     [McpServerTool(Name = "vm_create"), Description(
         "Create VM from VHDX — autoStart controls whether VM is started (default: false). " +
@@ -64,7 +47,15 @@ public static class VmTools
         "override via the HYPERV_MCP_VM_CREATE_TIMEOUT_SECONDS environment variable (range 60–600) " +
         "if you regularly create from bases larger than ~50 GB on slow storage. You may also pass " +
         "verifyBaseImageHash: false for an individual call to skip the hash check entirely — this " +
-        "accepts the documented ADR-4 trade-off (preserved-stat mutations are not detected for that call).")]
+        "accepts the documented ADR-4 trade-off (preserved-stat mutations are not detected for that call). " +
+        "adminPassword (optional, Issue #283) makes the new VM immediately usable: the built-in local " +
+        "Administrator account is configured to accept it, and the call does not return success until the " +
+        "VM is login-ready, so the very next vm_run_command with that password succeeds first try. It " +
+        "requires a sysprepped/generalized base image — a base that is not generalized, or whose state " +
+        "cannot be confirmed, is rejected with BASE_NOT_GENERALIZED before any VM is created. Supplying it " +
+        "always starts the VM regardless of autoStart. If the VM never becomes login-ready within the " +
+        "readiness limit, the call fails with READINESS_NOT_REACHED and the VM is preserved and named so " +
+        "you can inspect or delete it. Omit it for the unchanged no-password behavior.")]
     public static async Task<string> VmCreate(
         IToolDispatcher dispatcher,
         string name,
@@ -74,6 +65,7 @@ public static class VmTools
         long memoryMB = 4096,
         bool autoStart = false,
         bool verifyBaseImageHash = true,
+        string? adminPassword = null,
         CancellationToken ct = default)
     {
         return await dispatcher.DispatchAsync(
@@ -85,7 +77,8 @@ public static class VmTools
             ("cpuCount", cpuCount),
             ("memoryMB", memoryMB),
             ("autoStart", autoStart),
-            ("verifyBaseImageHash", verifyBaseImageHash));
+            ("verifyBaseImageHash", verifyBaseImageHash),
+            ("adminPassword", adminPassword));
     }
 
     [McpServerTool(Name = "vm_start"), Description("Start a stopped VM")]
@@ -118,7 +111,7 @@ public static class VmTools
             ("force", force));
     }
 
-    [McpServerTool(Name = "vm_os_install"), Description("Install OS from ISO image — fully automated, single call. Windows-only: non-Windows ISOs (those without sources\\install.wim) are rejected with OS_NOT_SUPPORTED. Set skipPreflight=true to bypass Windows-11 CPU/RAM/disk floors (e.g., for Windows Server / Win10).")]
+    [McpServerTool(Name = "vm_os_install"), Description("Install an OS from an ISO — fully automated, single call. Supported targets: Windows (ISO with sources\\install.wim) and Ubuntu Server 24.04 (ISO with a casper/ live-installer layout). Any other ISO is rejected with OS_NOT_SUPPORTED. For Ubuntu, pass the initial login user via guestUsername (default 'ubuntu') and its password via adminPassword; the server creates a Generation 2 / Secure-Boot-off VM and drives cloud-init autoinstall. Set skipPreflight=true to bypass the per-target CPU/RAM/disk floors (Windows-11 or Ubuntu-Server).")]
     public static async Task<string> VmOsInstall(
         IToolDispatcher dispatcher,
         string name,
@@ -134,6 +127,7 @@ public static class VmTools
         string? productKey = null,
         int timeoutMinutes = 60,
         bool skipPreflight = false,
+        string? guestUsername = null,
         CancellationToken ct = default)
     {
         return await dispatcher.DispatchAsync(
@@ -151,7 +145,8 @@ public static class VmTools
             ("windowsEdition", windowsEdition),
             ("productKey", productKey),
             ("timeoutMinutes", timeoutMinutes),
-            ("skipPreflight", skipPreflight));
+            ("skipPreflight", skipPreflight),
+            ("guestUsername", guestUsername));
     }
 
     [McpServerTool(Name = "vm_restart"), Description("Restart a VM")]
@@ -182,7 +177,7 @@ public static class VmTools
             ("hostId", hostId));
     }
 
-    [McpServerTool(Name = "vm_pause"), Description("Pause a running VM")]
+    [McpServerTool(Name = "vm_pause"), Description("Pause a running VM into in-memory Paused state (no CPU used, memory retained). On success the returned state is 'Paused'; a VM that only reaches Saved/Off or times out is reported as a failure.")]
     public static async Task<string> VmPause(
         IToolDispatcher dispatcher,
         string vmId,
@@ -210,9 +205,6 @@ public static class VmTools
             ("hostId", hostId));
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // Discovery
-    // ═══════════════════════════════════════════════════════════════════
 
     [McpServerTool(Name = "vm_list"), Description("List VMs with filtering")]
     public static async Task<string> VmList(
@@ -226,6 +218,23 @@ public static class VmTools
             ct,
             ("hostId", hostId),
             ("nameFilter", nameFilter));
+    }
+
+    [McpServerTool(Name = "vm_find_by_name"), Description(
+        "Find all VMs by whole literal name, including untagged VMs. Read-only; case-insensitive by default.")]
+    public static async Task<string> VmFindByName(
+        IToolDispatcher dispatcher,
+        string name,
+        string? hostId = null,
+        bool caseSensitive = false,
+        CancellationToken ct = default)
+    {
+        return await dispatcher.DispatchAsync(
+            "vm_find_by_name",
+            ct,
+            ("hostId", hostId),
+            ("name", name),
+            ("caseSensitive", caseSensitive));
     }
 
     [McpServerTool(Name = "vm_status"), Description("Get detailed VM status")]
@@ -242,12 +251,14 @@ public static class VmTools
             ("hostId", hostId));
     }
 
-    [McpServerTool(Name = "vm_wait_ready"), Description("Wait for VM readiness state")]
+    [McpServerTool(Name = "vm_wait_ready"), Description(Models.ToolCatalog.WaitReadyDescription)]
     public static async Task<string> VmWaitReady(
         IToolDispatcher dispatcher,
         string vmId,
         string? hostId = null,
         int timeoutSeconds = 300,
+        string? username = null,
+        string? password = null,
         CancellationToken ct = default)
     {
         return await dispatcher.DispatchAsync(
@@ -255,12 +266,11 @@ public static class VmTools
             ct,
             ("vmId", vmId),
             ("hostId", hostId),
-            ("timeoutSeconds", timeoutSeconds));
+            ("timeoutSeconds", timeoutSeconds),
+            ("username", username),
+            ("password", password));
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // Execution
-    // ═══════════════════════════════════════════════════════════════════
 
     [McpServerTool(Name = "vm_run_command"), Description("Execute single command on guest VM")]
     public static async Task<string> VmRunCommand(
@@ -310,9 +320,6 @@ public static class VmTools
             ("password", password));
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // File Transfer
-    // ═══════════════════════════════════════════════════════════════════
 
     [McpServerTool(Name = "vm_copy_file"), Description("Copy file or directory from host to guest")]
     public static async Task<string> VmCopyFile(
@@ -360,9 +367,6 @@ public static class VmTools
             ("password", password));
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // Checkpoints
-    // ═══════════════════════════════════════════════════════════════════
 
     [McpServerTool(Name = "vm_checkpoint"), Description("Create, restore, list, or delete checkpoints")]
     public static async Task<string> VmCheckpoint(
@@ -382,9 +386,6 @@ public static class VmTools
             ("name", name));
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // Storage
-    // ═══════════════════════════════════════════════════════════════════
 
     [McpServerTool(Name = "vm_list_images"), Description("List available base VHDX images")]
     public static async Task<string> VmListImages(
@@ -422,9 +423,6 @@ public static class VmTools
             ("password", password));
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // Cleanup
-    // ═══════════════════════════════════════════════════════════════════
 
     [McpServerTool(Name = "vm_cleanup_orphans"), Description("Find and destroy orphaned VMs")]
     public static async Task<string> VmCleanupOrphans(
@@ -440,9 +438,6 @@ public static class VmTools
             ("dryRun", dryRun));
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // Configuration
-    // ═══════════════════════════════════════════════════════════════════
 
     [McpServerTool(Name = "vm_configure"), Description("Modify VM settings: CPU, memory, network")]
     public static async Task<string> VmConfigure(

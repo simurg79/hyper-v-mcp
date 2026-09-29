@@ -19,17 +19,11 @@ namespace HyperV.Mcp.Server.Tests.McpInterface;
 /// </summary>
 public class ToolDiscoveryTests
 {
-    /// <summary>
-    /// The server must expose exactly 22 MCP tools covering the full management surface.
-    /// See /myplans/mcp-interface/mcp-interface-design.md — Complete Tool Catalog.
-    /// Includes vm_diag (P0 health tool), vm_os_install (P1), and vm_create_base_image (P2, Issue #51).
-    /// </summary>
     [Fact]
-    public void ToolCatalog_Contains_Exactly_22_Tools()
+    public void ToolCatalog_Contains_Exactly_23_Tools()
     {
-        ToolCatalog.AllTools.Should().HaveCount(22,
-            "the catalog specifies exactly 22 tools across 9 categories " +
-            "(see /myplans/mcp-interface/mcp-interface-design.md — Complete Tool Catalog, plus vm_diag, vm_os_install, vm_create_base_image)");
+        ToolCatalog.AllTools.Should().HaveCount(23,
+            "exact-name lookup adds one discovery tool without replacing vm_list");
     }
 
     /// <summary>
@@ -58,6 +52,7 @@ public class ToolDiscoveryTests
     [InlineData("vm_restart")]
     [InlineData("vm_destroy")]
     [InlineData("vm_list")]
+    [InlineData("vm_find_by_name")]
     [InlineData("vm_status")]
     [InlineData("vm_wait_ready")]
     [InlineData("vm_run_command")]
@@ -114,6 +109,7 @@ public class ToolDiscoveryTests
     [InlineData("vm_pause", ToolCategory.Lifecycle)]
     [InlineData("vm_resume", ToolCategory.Lifecycle)]
     [InlineData("vm_list", ToolCategory.Discovery)]
+    [InlineData("vm_find_by_name", ToolCategory.Discovery)]
     [InlineData("vm_status", ToolCategory.Discovery)]
     [InlineData("vm_wait_ready", ToolCategory.Discovery)]
     [InlineData("vm_run_command", ToolCategory.Execution)]
@@ -144,6 +140,7 @@ public class ToolDiscoveryTests
     [InlineData("vm_stop", ToolPriority.P0)]
     [InlineData("vm_destroy", ToolPriority.P0)]
     [InlineData("vm_list", ToolPriority.P0)]
+    [InlineData("vm_find_by_name", ToolPriority.P1)]
     [InlineData("vm_status", ToolPriority.P0)]
     [InlineData("vm_run_command", ToolPriority.P0)]
     [InlineData("vm_copy_file", ToolPriority.P0)]
@@ -204,8 +201,8 @@ public class ToolDiscoveryTests
 
         hostScoped.Should().NotContain("vm_echo",
             "vm_echo is a pure local health check and does not need hostId");
-        hostScoped.Should().HaveCount(20,
-            "20 of 22 tools are host-scoped (all except vm_echo and vm_diag)");
+        hostScoped.Should().HaveCount(21,
+            "21 of 23 tools are host-scoped (all except vm_echo and vm_diag)");
     }
 
     /// <summary>

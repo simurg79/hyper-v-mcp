@@ -1,29 +1,19 @@
 using System.Management.Automation.Runspaces;
 using FluentAssertions;
 using HyperV.Mcp.Server.Infrastructure;
+using HyperV.Mcp.Server.Tests.TestSupport;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
 namespace HyperV.Mcp.Server.Tests.Runtime;
 
-/// <summary>
-/// Smoke tests for the real <see cref="PowerShellHost"/>. These exercise the in-process
-/// PowerShell runspace, so they require the Hyper-V module to be installed (the host's
-/// own <c>EnsureInitializedAsync</c> probes <c>Get-VMHost</c>). Tests detect that
-/// constraint up front and skip themselves (return early) when it is not satisfied —
-/// the test project targets xUnit v2 which does not support <c>Assert.Skip</c>.
-///
-/// See PSD-D1, PSD-D2 in /myplans/issue-52/phase-2/powershell-direct-channel-design.md.
-/// </summary>
+/// <summary>Real-runspace smoke tests need the Hyper-V module because initialization probes Get-VMHost. Without it, return early: this
+/// project's xUnit v2 does not support Assert.Skip.</summary>
 [Trait("Category", "Runtime")]
 public class PowerShellHostTests
 {
-    /// <summary>
-    /// Returns true when the Hyper-V PowerShell module appears available. We use the
-    /// presence of the module manifest as a lightweight probe so we avoid actually
-    /// initializing the heavyweight runspace before deciding to skip.
-    /// </summary>
+    /// <summary>Probe the module manifest to avoid heavyweight runspace initialization before deciding to skip.</summary>
     private static bool HyperVModuleAvailable()
     {
         try
@@ -134,16 +124,9 @@ public class PowerShellHostTests
         await act.Should().ThrowAsync<ObjectDisposedException>();
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // Issue #52, Gate 6 Fix #1 — runspace-global serialization
-    // ═══════════════════════════════════════════════════════════════════════
 
-    /// <summary>
-    /// Concurrent <see cref="PowerShellHost.InvokeAsync"/> calls with DISTINCT bound
-    /// arguments must each observe their own value — proving the runspace-global
-    /// semaphore prevents cross-call clobbering of <c>SessionStateProxy</c> variables.
-    /// (Gate 6 Fix #1.)
-    /// </summary>
+    /// <summary>Distinct concurrent arguments must remain isolated: the global semaphore prevents SessionStateProxy variable
+    /// clobbering.</summary>
     [Fact]
     public async Task InvokeAsync_ConcurrentCalls_EachInvocationObservesItsOwnArgs()
     {
@@ -152,7 +135,6 @@ public class PowerShellHostTests
         using var host = new PowerShellHost(NullLogger<PowerShellHost>.Instance);
 
         const int N = 12;
-        // Script echoes the bound variable so we can pair input -> output.
         var tasks = Enumerable.Range(0, N).Select(i =>
         {
             var args = new Dictionary<string, object?>
@@ -174,15 +156,7 @@ public class PowerShellHostTests
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // Issue #52, Gate 6 Fix #2 — timeout enforcement
-    // ═══════════════════════════════════════════════════════════════════════
 
-    /// <summary>
-    /// <see cref="PowerShellHost.InvokeWithTimeoutAsync"/> with a tight timeout against a
-    /// long-sleeping script must throw <see cref="TimeoutException"/> within the budget.
-    /// (Gate 6 Fix #2.)
-    /// </summary>
     [Fact]
     public async Task InvokeWithTimeoutAsync_ScriptExceedsTimeout_ThrowsTimeoutException()
     {
@@ -204,11 +178,7 @@ public class PowerShellHostTests
             "timeout must fire within a small multiple of the configured budget");
     }
 
-    /// <summary>
-    /// When the caller cancels their token, <see cref="OperationCanceledException"/> is
-    /// thrown — NOT <see cref="TimeoutException"/>. Distinguishes caller-cancel from
-    /// command-timeout per Gate 6 Fix #2.
-    /// </summary>
+    /// <summary>Caller cancellation throws OperationCanceledException, not command-timeout TimeoutException.</summary>
     [Fact]
     public async Task InvokeWithTimeoutAsync_CallerCancellation_ThrowsOperationCanceledNotTimeout()
     {
@@ -234,18 +204,9 @@ public class PowerShellHostTests
         thrown.Should().NotBeOfType<TimeoutException>();
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // Issue #52, Gate 6 Fix #6 + Phase 2 Gate 3 RC-3 — probe classifier
-    // ═══════════════════════════════════════════════════════════════════════
 
-    /// <summary>
-    /// RC-3 (Issue #52 Phase 2 Gate 3): the matcher now requires BOTH an
-    /// <see cref="ArgumentNullException"/> (or compatible <c>ParameterBindingException</c>)
-    /// AND a message that <b>starts with</b> "Value cannot be null". The previous
-    /// implementation accepted any exception whose message merely contained the substring
-    /// — which falsely matched unrelated <see cref="ArgumentNullException"/>s and masked
-    /// real PS5.1-fallback module-load failures (the original RC-2 root cause).
-    /// </summary>
+    /// <summary>Require ArgumentNullException or qualifying ParameterBindingException plus a message starting "Value cannot be null".
+    /// Substring-only matching masked real PS5.1 fallback module-load failures.</summary>
     [Theory]
     [InlineData("Value cannot be null. (Parameter 'serverName')", true)]
     [InlineData("value cannot be null", true)]
@@ -255,8 +216,7 @@ public class PowerShellHostTests
     [InlineData(null, false)]
     public void MatchesValueCannotBeNullSignature_Classifies(string? message, bool expected)
     {
-        // Use ArgumentNullException so the type-match leg is satisfied; the test is then
-        // exercising the message-shape check exclusively.
+        // Satisfy the type check to isolate message-shape matching.
         var ex = message is null ? null : new ArgumentNullException("name", message);
         PowerShellHost.MatchesValueCannotBeNullSignature(ex).Should().Be(expected);
     }
@@ -267,13 +227,8 @@ public class PowerShellHostTests
         PowerShellHost.MatchesValueCannotBeNullSignature(null).Should().BeFalse();
     }
 
-    /// <summary>
-    /// RC-3 false-positive guard: an unrelated exception (e.g.
-    /// <see cref="InvalidOperationException"/>) whose message happens to start with
-    /// "Value cannot be null" must NOT be classified as the PS7 Hyper-V bug. Only
-    /// <see cref="ArgumentNullException"/> / qualifying <see cref="ParameterBindingException"/>
-    /// in the inner-exception chain may match.
-    /// </summary>
+    /// <summary>A matching message on an unrelated exception must not trigger PS7 bug classification; only qualifying types in the inner
+    /// chain may match.</summary>
     [Fact]
     public void MatchesValueCannotBeNullSignature_NonArgumentNull_DoesNotMatch()
     {
@@ -283,12 +238,8 @@ public class PowerShellHostTests
             "the phrase — the type chain must include ArgumentNullException (RC-3).");
     }
 
-    /// <summary>
-    /// RC-3 false-positive guard: a <c>CommandNotFoundException</c>-style failure with
-    /// an embedded <see cref="ArgumentNullException"/> whose message does not start with
-    /// "Value cannot be null" must NOT be classified as the PS7 Hyper-V bug. This is the
-    /// exact misclassification path that masked RC-2 in live testing.
-    /// </summary>
+    /// <summary>A CommandNotFoundException-style failure with an inner ArgumentNullException lacking the required prefix must not match:
+    /// that misclassification masked live module-load failures.</summary>
     [Fact]
     public void MatchesValueCannotBeNullSignature_CommandNotFoundWithEmbeddedAne_DoesNotMatch()
     {
@@ -303,11 +254,8 @@ public class PowerShellHostTests
             "must not be classified as the PS7 Hyper-V autoload bug (RC-3).");
     }
 
-    /// <summary>
-    /// RC-3 positive case: an <see cref="ArgumentNullException"/> wrapped inside another
-    /// exception whose top-level message starts with "Value cannot be null" must still
-    /// match — we walk the inner-exception chain.
-    /// </summary>
+    /// <summary>Walk inner exceptions: a wrapped ArgumentNullException still qualifies when the top-level message has the required
+    /// prefix.</summary>
     [Fact]
     public void MatchesValueCannotBeNullSignature_InnerArgumentNull_Matches()
     {
@@ -321,22 +269,10 @@ public class PowerShellHostTests
             "phrase must match (RC-3 walks the inner-exception chain).");
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // Issue #52 Phase 2 Gate 3 RC-4 — cached init failure
-    // ═══════════════════════════════════════════════════════════════════════
 
-    /// <summary>
-    /// RC-4: when the host has a cached init failure, subsequent
-    /// <see cref="PowerShellHost.EnsureInitializedAsync"/> calls must re-throw the cached
-    /// failure WITHOUT re-running the (slow) PS7 + PS5.1 probe sequence.
-    ///
-    /// We can't easily simulate an init failure via the public API on a machine where
-    /// Hyper-V actually loads. Instead, this test asserts the contract: after a successful
-    /// initialization, repeated calls return immediately (the existing fast-path) and after
-    /// dispose the host throws <see cref="ObjectDisposedException"/>.
-    /// The pure-failure-cache path is exercised by integration tests on machines where
-    /// Hyper-V is unavailable.
-    /// </summary>
+    /// <summary>Cached initialization failure must rethrow without repeating slow PS7/PS5.1 probes. This test only checks the success fast
+    /// path and disposal because public-API failure is hard to induce where Hyper-V loads; integration tests without Hyper-V cover failure
+    /// caching.</summary>
     [Fact]
     public async Task EnsureInitializedAsync_AfterSuccess_FastPathDoesNotRePr()
     {
@@ -353,31 +289,18 @@ public class PowerShellHostTests
             "second call must hit the _initialized fast-path, not re-run probes (RC-4).");
     }
 
-    /// <summary>
-    /// RC-4-fix-C (🟡): when the host has a cached init failure, subsequent
-    /// <see cref="PowerShellHost.EnsureInitializedAsync"/> calls must rethrow the SAME
-    /// cached exception WITHOUT re-running the probe sequence. This is the
-    /// fail-fast-on-cached-failure path that the original RC-4 fast-path test did NOT
-    /// exercise. A regression that re-probed on every failed call would not have been
-    /// caught by the success-path test alone.
-    ///
-    /// Uses a tiny test-seam subclass that overrides
-    /// <see cref="PowerShellHost.ProbeAndOpenRunspaceAsync"/> to throw deterministically
-    /// and count invocations — no real PowerShell startup, no Hyper-V dependency, no
-    /// timing flakiness.
-    /// </summary>
+    /// <summary>The success-path test cannot catch repeated probing after failure. Override ProbeAndOpenRunspaceAsync to count
+    /// deterministic failures and verify the same exception is cached, without real startup, Hyper-V or timing dependence.</summary>
     [Fact]
     public async Task EnsureInitializedAsync_AfterFailure_RethrowsCachedFailure_DoesNotReProbe()
     {
         using var host = new ThrowingProbeHost(NullLogger<PowerShellHost>.Instance);
 
-        // First call: probe runs, throws, host caches the failure.
         var first = await Record.ExceptionAsync(() =>
             host.EnsureInitializedAsync(CancellationToken.None));
         first.Should().NotBeNull("the test seam forces a probe failure on first call");
         host.ProbeCallCount.Should().Be(1, "probe must run exactly once on first call");
 
-        // Second call: must rethrow WITHOUT re-probing.
         var second = await Record.ExceptionAsync(() =>
             host.EnsureInitializedAsync(CancellationToken.None));
         second.Should().NotBeNull(
@@ -386,29 +309,20 @@ public class PowerShellHostTests
             "probe must NOT be invoked a second time — cached failure short-circuits " +
             "BEFORE acquiring the init lock or re-running the PS7/PS5.1 sequence (RC-4-fix-C).");
 
-        // The thrown failure must reference the original probe exception (chained as
-        // InnerException by EnsureInitializedAsync) — proving it's the cached one and
-        // not a fresh exception from a re-probe.
+        // The original inner exception proves cached failure, not a fresh probe.
         second!.InnerException.Should().NotBeNull();
         second.InnerException!.Message.Should().Be(ThrowingProbeHost.ProbeErrorMessage,
             "the cached failure (InnerException) must be the original probe exception, " +
             "proving the host short-circuits without rerunning the probe.");
 
-        // Third call: still exactly one probe.
         await Record.ExceptionAsync(() => host.EnsureInitializedAsync(CancellationToken.None));
         host.ProbeCallCount.Should().Be(1,
             "the probe must remain at one invocation across N>=3 failed attempts.");
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // Issue #52 Phase 2 live-debug instrumentation — diagnostics surface
-    // ═══════════════════════════════════════════════════════════════════════
 
-    /// <summary>
-    /// Phase 2 diag: when init fails, the cached-rethrow's <c>Message</c> must include
-    /// the underlying exception's TYPE and MESSAGE — not the previous opaque string.
-    /// The original exception remains as <c>InnerException</c>.
-    /// </summary>
+    /// <summary>Cached failure messages must expose the underlying type/message rather than an opaque wrapper; retain the original
+    /// InnerException.</summary>
     [Fact]
     public async Task EnsureInitializedAsync_AfterFailure_RethrowMessage_IncludesUnderlyingTypeAndMessage()
     {
@@ -432,11 +346,7 @@ public class PowerShellHostTests
             "the original cached failure must remain as InnerException for error mapping.");
     }
 
-    /// <summary>
-    /// Phase 2 diag: <see cref="IPowerShellHost.GetInitDiagnostics"/> on a fresh host
-    /// (never initialized) reports <c>Initialized=false</c>, no error, and a non-null
-    /// <c>PsModulePath</c> (the dotnet host process always has one on Windows).
-    /// </summary>
+    /// <summary>A fresh Windows host reports Initialized=false, no error and a non-null PsModulePath.</summary>
     [Fact]
     public void GetInitDiagnostics_FreshHost_ReportsNotInitializedNoError()
     {
@@ -451,17 +361,12 @@ public class PowerShellHostTests
         diag.LastInitErrorTrace.Should().BeNull();
     }
 
-    /// <summary>
-    /// Phase 2 diag: after a cached init failure,
-    /// <see cref="IPowerShellHost.GetInitDiagnostics"/> reports the full failure chain
-    /// (type, message, trace) — the data <c>vm_diag.phase2Host</c> surfaces.
-    /// </summary>
+    /// <summary>Cached failure diagnostics expose the full type/message/trace chain used by vm_diag.phase2Host.</summary>
     [Fact]
     public async Task GetInitDiagnostics_AfterFailure_ReportsCachedFailureDetail()
     {
         using var host = new ThrowingProbeHost(NullLogger<PowerShellHost>.Instance);
 
-        // Drive a failed init so the failure cache is populated.
         await Record.ExceptionAsync(() =>
             host.EnsureInitializedAsync(CancellationToken.None));
 
@@ -477,25 +382,18 @@ public class PowerShellHostTests
         diag.LastInitErrorTrace.Should().Contain(ThrowingProbeHost.ProbeErrorMessage);
     }
 
-    // ---------------------------------------------------------------------
-    // RC-6 (Issue #52 Phase 2 Gate 3 Loopback #3) — AugmentPsModulePath helper.
-    // ---------------------------------------------------------------------
 
     [Fact]
     public void AugmentPsModulePath_PrependsWindowsPowerShellRoots_WhenMissing()
     {
-        // Arrange — a PSModulePath that omits the System32 + Program Files roots
-        // (this is the exact failure mode observed in vm_diag.phase2Host smoke v8).
+        // Reproduce the observed missing System32 and Program Files module roots.
         const string current =
             @"C:\Users\test\OneDrive\Documents\PowerShell\Modules;" +
             @"C:\Program Files\PowerShell\Modules;" +
             @"C:\some\other\path";
 
-        // Act
         string augmented = PowerShellHost.AugmentPsModulePath(current);
 
-        // Assert — both Windows PowerShell roots are prepended (in declared order)
-        // and the original entries are preserved after them.
         string[] entries = augmented.Split(';', StringSplitOptions.RemoveEmptyEntries);
         entries.Length.Should().BeGreaterThanOrEqualTo(5);
         entries[0].Should().Be(PowerShellHost.WindowsPowerShellModuleRoots[0]);
@@ -508,9 +406,7 @@ public class PowerShellHostTests
     [Fact]
     public void AugmentPsModulePath_DeduplicatesCaseInsensitive_WhenAlreadyPresent()
     {
-        // Arrange — supply the System32 root with an alternate casing PLUS a
-        // duplicate of the Program Files root in the original casing. The helper
-        // must not double-list either.
+        // Alternate casing and duplicate roots must not create duplicate entries.
         string system32Root = PowerShellHost.WindowsPowerShellModuleRoots[0];
         string programFilesRoot = PowerShellHost.WindowsPowerShellModuleRoots[1];
         string current =
@@ -518,37 +414,29 @@ public class PowerShellHostTests
             programFilesRoot + ";" +
             @"C:\extra\path";
 
-        // Act
         string augmented = PowerShellHost.AugmentPsModulePath(current);
 
-        // Assert — each unique (case-insensitive) entry appears exactly once.
         string[] entries = augmented.Split(';', StringSplitOptions.RemoveEmptyEntries);
         entries.Count(e => string.Equals(e, system32Root, StringComparison.OrdinalIgnoreCase))
             .Should().Be(1, "system32 root must be deduplicated case-insensitively");
         entries.Count(e => string.Equals(e, programFilesRoot, StringComparison.OrdinalIgnoreCase))
             .Should().Be(1, "Program Files root must be deduplicated case-insensitively");
         entries.Should().Contain(@"C:\extra\path");
-        // The first occurrence wins — since the helper prepends roots first using
-        // their canonical casing, the Program-Files duplicate from `current` is
-        // dropped, leaving the canonical-cased root in position [1].
+        // First occurrence wins: prepended canonical casing replaces the duplicate from current.
         entries[1].Should().Be(programFilesRoot);
     }
 
     [Fact]
     public void AugmentPsModulePath_HandlesNullAndEmpty()
     {
-        // Null input — must still produce both Windows PowerShell roots.
         string fromNull = PowerShellHost.AugmentPsModulePath(null);
         string[] nullEntries = fromNull.Split(';', StringSplitOptions.RemoveEmptyEntries);
         nullEntries.Should().Equal(PowerShellHost.WindowsPowerShellModuleRoots);
 
-        // Empty input — same.
         string fromEmpty = PowerShellHost.AugmentPsModulePath(string.Empty);
         string[] emptyEntries = fromEmpty.Split(';', StringSplitOptions.RemoveEmptyEntries);
         emptyEntries.Should().Equal(PowerShellHost.WindowsPowerShellModuleRoots);
 
-        // Whitespace-only entries are dropped from the existing portion but the
-        // roots are still emitted.
         string fromWhitespace = PowerShellHost.AugmentPsModulePath("   ;  ;");
         string[] wsEntries = fromWhitespace.Split(';', StringSplitOptions.RemoveEmptyEntries);
         wsEntries.Should().Equal(PowerShellHost.WindowsPowerShellModuleRoots);
@@ -557,12 +445,10 @@ public class PowerShellHostTests
     [Fact]
     public void AugmentPsModulePath_PreservesOrderOfExistingEntries()
     {
-        // Defensive — order matters because PSModulePath resolution is left-to-right
-        // and we must not silently reshuffle a caller-supplied search order.
+        // PSModulePath resolves left-to-right; preserve caller search order after prepended roots.
         const string current = @"C:\a;C:\b;C:\c";
         string augmented = PowerShellHost.AugmentPsModulePath(current);
         string[] entries = augmented.Split(';', StringSplitOptions.RemoveEmptyEntries);
-        // After the prepended roots, the original entries must appear in the same order.
         int aIdx = Array.IndexOf(entries, @"C:\a");
         int bIdx = Array.IndexOf(entries, @"C:\b");
         int cIdx = Array.IndexOf(entries, @"C:\c");
@@ -571,24 +457,13 @@ public class PowerShellHostTests
         cIdx.Should().BeGreaterThan(bIdx);
     }
 
-    // ---------------------------------------------------------------------
-    // RC-10.2 (Issue #52 Phase 2) — AugmentPsModulePath must STRIP the
-    // bin-local PS7 SDK module subtree (runtimes\win\lib\net*\Modules).
-    // That subtree contains a full copy of PS7's intrinsic modules
-    // (Microsoft.PowerShell.Security, etc.) shipped by Microsoft.PowerShell.SDK.
-    // PS7 finds e.g. ConvertTo-SecureString there first, but
-    // AuthorizationManager.PassesPolicyCheck() rejects loading the unsigned
-    // bin-path .types.ps1xml under Code Integrity / catalog signing policy,
-    // shadowing the system Microsoft.PowerShell.Security and breaking
-    // New-PSSession credential parameter binding.
-    // ---------------------------------------------------------------------
+    // Strip the SDK bin-local runtimes\win\lib\net*\Modules subtree: its unsigned .types.ps1xml files fail Code Integrity/catalog policy,
+    // shadow system Security cmdlets such as ConvertTo-SecureString and break New-PSSession credential binding.
 
     [Fact]
     public void AugmentPsModulePath_StripsBinLocalSdkModuleSubtree_Net8()
     {
-        // Arrange — the exact poison entry observed in the harness Variant A
-        // failure (RC-10.1 re-run): a bin-local SDK runtimes\win\lib\net8.0\Modules
-        // path inserted by Microsoft.PowerShell.SDK static init.
+        // Reproduce the bin-local module path inserted by SDK static initialization.
         const string binLocal =
             @"c:\git\hyper-v-mcp-server\src\hyperv.mcp.server\bin\release\net8.0-windows\runtimes\win\lib\net8.0\Modules";
         string current =
@@ -597,10 +472,8 @@ public class PowerShellHostTests
             binLocal + ";" +
             @"C:\some\other\path";
 
-        // Act
         string augmented = PowerShellHost.AugmentPsModulePath(current);
 
-        // Assert — no entry in the result matches the SDK-shipped subtree shape.
         string[] entries = augmented.Split(';', StringSplitOptions.RemoveEmptyEntries);
         var sdkPattern = new System.Text.RegularExpressions.Regex(
             @"\\runtimes\\win\\lib\\net\d+(\.\d+)?(-[a-z]+)?\\Modules\\?$",
@@ -612,7 +485,6 @@ public class PowerShellHostTests
         entries.Should().NotContain(e =>
             e.IndexOf(@"\runtimes\win\lib\", StringComparison.OrdinalIgnoreCase) >= 0,
             "no SDK runtimes subtree entry should survive augmentation");
-        // Sanity — legitimate entries remain.
         entries.Should().Contain(@"C:\some\other\path");
         entries[0].Should().Be(PowerShellHost.WindowsPowerShellModuleRoots[0]);
     }
@@ -620,17 +492,14 @@ public class PowerShellHostTests
     [Fact]
     public void AugmentPsModulePath_StripsBinLocalSdkModuleSubtree_AcrossNetVersions()
     {
-        // Arrange — multiple net*\Modules variants (case + version permutations).
         const string current =
             @"C:\app\bin\Release\net9.0-windows\runtimes\win\lib\net9.0\Modules;" +
             @"C:\app\bin\Debug\net8.0-windows\Runtimes\Win\Lib\Net8.0\MODULES;" +
             @"C:\app\bin\Release\net10.0-windows\runtimes\win\lib\net10.0\Modules\;" +
             @"C:\legit\path";
 
-        // Act
         string augmented = PowerShellHost.AugmentPsModulePath(current);
 
-        // Assert
         string[] entries = augmented.Split(';', StringSplitOptions.RemoveEmptyEntries);
         entries.Should().NotContain(e =>
             e.IndexOf(@"\runtimes\win\lib\", StringComparison.OrdinalIgnoreCase) >= 0,
@@ -641,27 +510,19 @@ public class PowerShellHostTests
     [Fact]
     public void AugmentPsModulePath_DoesNotStrip_NonSdkPathsContainingNetSubstring()
     {
-        // Arrange — defensive: a legitimate path that happens to contain "net" in a
-        // segment must NOT be stripped. Only the specific SDK shape matches.
+        // A legitimate path containing net is not the SDK subtree and must survive.
         const string benign1 = @"C:\Tools\dotnet\Modules";
         const string benign2 = @"C:\Program Files\WindowsPowerShell\Modules\NetCore";
         string current = benign1 + ";" + benign2;
 
-        // Act
         string augmented = PowerShellHost.AugmentPsModulePath(current);
 
-        // Assert — both benign paths survive.
         string[] entries = augmented.Split(';', StringSplitOptions.RemoveEmptyEntries);
         entries.Should().Contain(benign1);
         entries.Should().Contain(benign2);
     }
 
-    /// <summary>
-    /// Test seam — production constructor uses the default PS7 → PS5.1 probe.
-    /// This subclass overrides <see cref="PowerShellHost.ProbeAndOpenRunspaceAsync"/> so
-    /// tests can deterministically force a probe failure and count how many times the
-    /// probe is invoked, without spinning up the real PowerShell SDK.
-    /// </summary>
+    /// <summary>Override the PS7/PS5.1 probe to force and count failures without starting the SDK.</summary>
     private sealed class ThrowingProbeHost : PowerShellHost
     {
         public const string ProbeErrorMessage = "probe-failure-marker (RC-4-fix-C test seam)";
@@ -678,21 +539,12 @@ public class PowerShellHostTests
         }
     }
 
-    // ---------------------------------------------------------------------
-    // RC-8 (Issue #52 Phase 2 Gate 3 Loopback #4) — per-edition attempt
-    // diagnostics + builder.
-    // ---------------------------------------------------------------------
 
-    /// <summary>
-    /// RC-8: <see cref="PowerShellEditionAttemptBuilder.RecordException"/> must
-    /// flatten the outer + immediate-inner exception payload AND populate
-    /// <c>FullExceptionToString</c> with every level via <see cref="Exception.ToString"/>.
-    /// </summary>
+    /// <summary>Capture outer and immediate-inner exception fields plus every level in FullExceptionToString.</summary>
     [Fact]
     public void PowerShellEditionAttempt_RecordExceptionFlattensInnerChain()
     {
-        // Arrange — a 3-level exception chain so we can confirm the immediate
-        // inner is captured AND that FullExceptionToString contains all three.
+        // Three exception levels distinguish immediate-inner fields from full-chain text.
         Exception inner2;
         try { throw new InvalidOperationException("inner2"); }
         catch (Exception ex) { inner2 = ex; }
@@ -711,34 +563,26 @@ public class PowerShellHostTests
             FailureStage = "test.stage",
         };
 
-        // Act
         builder.RecordException(outer);
         var attempt = builder.Build();
 
-        // Assert — outer
         attempt.Attempted.Should().BeTrue();
         attempt.Succeeded.Should().BeFalse();
         attempt.FailureStage.Should().Be("test.stage");
         attempt.ExceptionType.Should().Be(typeof(InvalidOperationException).FullName);
         attempt.ExceptionMessage.Should().Be("outer");
 
-        // Assert — immediate inner (inner1, NOT inner2)
         attempt.InnerExceptionType.Should().Be(typeof(ApplicationException).FullName);
         attempt.InnerExceptionMessage.Should().Be("inner1");
         attempt.InnerExceptionStackTrace.Should().NotBeNullOrEmpty(
             "the immediate inner exception's stack trace is the missing signal RC-8 captures");
 
-        // Assert — FullExceptionToString must contain ALL three levels' messages.
         attempt.FullExceptionToString.Should().NotBeNullOrEmpty();
         attempt.FullExceptionToString!.Should().Contain("outer");
         attempt.FullExceptionToString.Should().Contain("inner1");
         attempt.FullExceptionToString.Should().Contain("inner2");
     }
 
-    /// <summary>
-    /// RC-8: a fresh host (no probe yet) must report both edition-attempt fields
-    /// as <c>null</c> (i.e. neither path has been entered).
-    /// </summary>
     [Fact]
     public void GetInitDiagnostics_BeforeAnyAttempt_ReportsNullEditionAttempts()
     {
@@ -750,12 +594,6 @@ public class PowerShellHostTests
         diag.Ps51Attempt.Should().BeNull();
     }
 
-    /// <summary>
-    /// RC-8: after a probe failure that records both PS7 and PS5.1 attempts via
-    /// the test seam, <see cref="IPowerShellHost.GetInitDiagnostics"/> must
-    /// surface both per-edition records with their <c>FailureStage</c> and
-    /// <c>InnerExceptionStackTrace</c> populated.
-    /// </summary>
     [Fact]
     public async Task GetInitDiagnostics_AfterFailure_ReportsPerEditionAttempts()
     {
@@ -778,12 +616,8 @@ public class PowerShellHostTests
         diag.Ps51Attempt.InnerExceptionStackTrace.Should().NotBeNullOrEmpty();
     }
 
-    /// <summary>
-    /// Test seam — overrides the probe to populate both per-edition attempt
-    /// records (via the protected <c>SetEditionAttemptsForTesting</c> hook) and
-    /// then throw, simulating the production "both editions failed" path
-    /// without requiring real PowerShell SDK calls.
-    /// </summary>
+    /// <summary>Populate both edition-attempt records through the protected hook, then throw to simulate both editions failing without SDK
+    /// calls.</summary>
     private sealed class EditionAttemptRecordingHost : PowerShellHost
     {
         public EditionAttemptRecordingHost(ILogger<PowerShellHost> logger) : base(logger) { }
@@ -791,8 +625,7 @@ public class PowerShellHostTests
         protected override Task<(Runspace Runspace, PowerShellEdition Edition)>
             ProbeAndOpenRunspaceAsync(CancellationToken ct)
         {
-            // Build a realistic 2-level exception chain so InnerExceptionStackTrace
-            // can be populated by the builder.
+            // Throw a two-level exception chain so the builder can capture the inner stack trace.
             Exception innerPs7;
             try { throw new ArgumentNullException("name"); }
             catch (Exception ex) { innerPs7 = ex; }
@@ -823,19 +656,10 @@ public class PowerShellHostTests
         }
     }
 
-    // ===================================================================
-    // Issue #52 Phase 2 Gate 3 Loopback #5 - RC-9: adopt PS5.1 when PS7 fails.
-    // Regression tests for the bug where ps51Attempt.Succeeded == true was
-    // discarded by an aggregate "neither worked" InvalidOperationException.
-    // ===================================================================
+    // A successful PS5.1 open must not be discarded by an aggregate "neither worked" exception after PS7 fails.
 
-    /// <summary>
-    /// RC-9 PRIMARY FIX (Tester smoke probe #5 regression): when the PS7 probe
-    /// fails BUT the PS5.1 open succeeds, the host MUST adopt the PS5.1 runspace
-    /// and report Initialized=true, Edition=WindowsPowerShell51 - instead of
-    /// throwing the aggregate "neither PS7 nor PS5.1 could load" exception that
-    /// discards the working PS5.1 runspace.
-    /// </summary>
+    /// <summary>Adopt the working PS5.1 runspace after PS7 failure and report Initialized=true, Edition=WindowsPowerShell51, not aggregate
+    /// failure.</summary>
     [Fact]
     public async Task ProbeAndOpenRunspaceAsync_Ps7Fails_Ps51Succeeds_AdoptsPs51Runspace()
     {
@@ -843,7 +667,6 @@ public class PowerShellHostTests
 
         Func<Task> act = () => host.EnsureInitializedAsync(CancellationToken.None);
 
-        // BEFORE RC-9: this assertion fails - host throws the aggregate exception.
         await act.Should().NotThrowAsync(
             "RC-9: when PS7 fails but PS5.1 succeeds, the working PS5.1 runspace " +
             "must be adopted, not discarded with an aggregate failure.");
@@ -863,13 +686,8 @@ public class PowerShellHostTests
             "no init failure should be cached when PS5.1 succeeded.");
     }
 
-    /// <summary>
-    /// RC-9 companion: when BOTH PS7 and PS5.1 fail, the host must throw an
-    /// InvalidOperationException whose message preserves the existing
-    /// "neither PowerShell 7 nor Windows PowerShell 5.1" wording for log/test
-    /// consumer compatibility, and both per-edition attempt records must be
-    /// populated.
-    /// </summary>
+    /// <summary>When both editions fail, preserve the "neither PowerShell 7 nor Windows PowerShell 5.1" wording for log/test consumers and
+    /// populate both attempt records.</summary>
     [Fact]
     public async Task ProbeAndOpenRunspaceAsync_BothFail_ThrowsAggregateWithBothEditionAttempts()
     {
@@ -881,8 +699,8 @@ public class PowerShellHostTests
         thrown.Should().NotBeNull();
         thrown.Should().BeOfType<InvalidOperationException>();
 
-        // Walk the inner-exception chain for the canonical phrase, since the
-        // outer wrapper prepends "PowerShell host previously failed to initialize:".
+        // Walk the inner-exception chain for the canonical phrase, since the outer wrapper prepends "PowerShell host previously failed to
+        // initialize:".
         bool foundCanonicalPhrase = false;
         Exception? cursor = thrown;
         while (cursor is not null)
@@ -908,14 +726,8 @@ public class PowerShellHostTests
         diag.LastInitError.Should().NotBeNull();
     }
 
-    /// <summary>
-    /// RC-9 SECONDARY FIX: when the PS7 probe detects the "Value cannot be null"
-    /// non-interactive bug, the resulting wrapper exception MUST preserve the
-    /// original signature exception via Exception.InnerException so
-    /// Ps7Attempt.InnerExceptionType and Ps7Attempt.InnerExceptionStackTrace
-    /// are populated for triage. Tester probe #5 saw both as null - that is
-    /// the regression.
-    /// </summary>
+    /// <summary>Preserve the PS7 "Value cannot be null" signature exception as InnerException so attempt type/stack fields remain available
+    /// for triage; both were previously null.</summary>
     [Fact]
     public async Task Ps7CatchBlock_PreservesOriginalExceptionInInnerException()
     {
@@ -935,12 +747,8 @@ public class PowerShellHostTests
             "the original exception's stack trace must propagate into the diagnostic record.");
     }
 
-    // ----- RC-9 test seams -----
 
-    /// <summary>
-    /// Test seam: PS7 returns null (failure), PS5.1 returns a working in-process
-    /// runspace. Drives the RC-9 primary regression test.
-    /// </summary>
+    /// <summary>Use a working in-process runspace as the PS5.1 stand-in after PS7 fails.</summary>
     private sealed class Ps7FailsPs51SucceedsHost : PowerShellHost
     {
         public Ps7FailsPs51SucceedsHost(ILogger<PowerShellHost> logger) : base(logger) { }
@@ -966,11 +774,7 @@ public class PowerShellHostTests
 
         protected override Runspace OpenWindowsPowerShell51ForTesting()
         {
-            // In-process default runspace stand-in for the real OOP PS5.1 child.
-            // Inject a Get-VMHost stub that THROWS, so any pre-fix orchestration
-            // logic which gates adoption on a post-open ProbeHyperV(Get-VMHost)
-            // call deterministically fails — proving the regression is caught
-            // regardless of whether the dev box has Hyper-V installed.
+            // The in-process PS5.1 stand-in throws from Get-VMHost so obsolete post-open probing fails regardless of installed Hyper-V.
             var rs = RunspaceFactory.CreateRunspace();
             rs.Open();
             using (var ps = System.Management.Automation.PowerShell.Create())
@@ -987,9 +791,6 @@ public class PowerShellHostTests
         }
     }
 
-    /// <summary>
-    /// Test seam: both PS7 and PS5.1 fail. Drives the aggregate-failure regression test.
-    /// </summary>
     private sealed class BothEditionsFailHost : PowerShellHost
     {
         public BothEditionsFailHost(ILogger<PowerShellHost> logger) : base(logger) { }
@@ -1022,12 +823,8 @@ public class PowerShellHostTests
         }
     }
 
-    /// <summary>
-    /// Test seam: simulates the PS7 non-interactive "Value cannot be null" bug
-    /// path so the catch/diagnostic capture is exercised end-to-end. PS5.1 also
-    /// fails so a failure is cached and the captured PS7 record can be
-    /// inspected.
-    /// </summary>
+    /// <summary>Simulate the PS7 non-interactive bug and fail PS5.1 too, caching failure so the PS7 diagnostic record can be
+    /// inspected.</summary>
     private sealed class Ps7NonInteractiveBugHost : PowerShellHost
     {
         public Ps7NonInteractiveBugHost(ILogger<PowerShellHost> logger) : base(logger) { }
@@ -1072,45 +869,18 @@ public class PowerShellHostTests
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // RC-10.3a (Issue #52 Phase 2) — diagnostic surfacing of failure detail
-    //
-    // Problem: when a script writes a non-terminating ErrorRecord to
-    // ps.Streams.Error AND then raises a terminating exception (e.g. via
-    // `throw` or `-ErrorAction Stop`), the C# `ps.Invoke()` call throws
-    // BEFORE the existing post-Invoke drain runs. Net effect in production
-    // (RC-10.2 → RC-10.3): result.Stderr is empty, the SessionStore wraps
-    // it as "Failed to create PSSession '...': " with nothing after the
-    // colon, and the real failure is invisible.
-    //
-    // This test exercises both paths simultaneously and asserts BOTH the
-    // non-terminating marker AND the terminating marker appear in
-    // result.Stderr. PRE-FIX the assertion fails because the drain only
-    // runs on the success path.
-    // ═══════════════════════════════════════════════════════════════════════
+    // A terminating ps.Invoke() exception bypassed the success-only error drain, leaving session failures blank. Both prior non-terminating
+    // errors and the terminating exception must appear in Stderr.
 
     [Fact]
     public async Task InvokeAsync_NonTerminatingThenTerminating_BothMarkersAppearInStderr()
     {
-        // Use a bare-runspace test seam so the test runs on machines without
-        // Hyper-V installed (the production probe gates on Get-VMHost). The
-        // RC-10.3a fix lives entirely in InvokeAsync's post-execution stderr
-        // assembly, so the runspace's module set is irrelevant.
+        // Use a bare runspace without Hyper-V: stderr assembly is module-independent.
         using var host = new BareRunspaceHost(NullLogger<PowerShellHost>.Instance);
 
-        // Repro of the RC-10.3 production gap: a non-terminating ErrorRecord
-        // lands in ps.Streams.Error, then a CLR-level terminating exception
-        // ESCAPES ps.Invoke() (via $ErrorActionPreference = 'Stop' which makes
-        // Write-Error promote to ActionPreferenceStopException — that's the
-        // path that bypasses the post-Invoke drain entirely because the C#
-        // catch only handles PipelineStoppedException).
-        //
-        // The non-terminating marker must be drained from ps.Streams.Error
-        // (it landed there before $ErrorActionPreference was switched). The
-        // terminating marker must be flattened from the CLR exception caught
-        // by InvokeAsync. Pre-fix, the load-bearing assertion is the
-        // [RC103a:...] prefix check — only the post-fix code path emits
-        // that frame when flattening drained errors / caught exceptions.
+        // Write a non-terminating error, then use ErrorActionPreference=Stop to raise ActionPreferenceStopException past the
+        // PipelineStoppedException-only catch. Drain the first error and flatten the caught exception; the framed diagnostic prefix
+        // distinguishes this from the old raw ErrorRecord.ToString() output.
         const string script =
             "Write-Error 'RC103a_NONTERMINATING_MARKER'; " +
             "$ErrorActionPreference = 'Stop'; " +
@@ -1121,9 +891,7 @@ public class PowerShellHostTests
         result.Success.Should().BeFalse(
             "a script that triggers a terminating Write-Error must report failure");
 
-        // Both markers must be visible — the non-terminating one came from
-        // ps.Streams.Error (drain) and the terminating one came from the
-        // ActionPreferenceStopException raised by ps.Invoke() (flattened).
+        // Both markers must survive: one from Streams.Error, one from the terminating exception.
         result.Stderr.Should().Contain("RC103a_NONTERMINATING_MARKER",
             "the non-terminating ErrorRecord MUST be drained from " +
             "ps.Streams.Error into result.Stderr even when ps.Invoke() throws " +
@@ -1133,10 +901,7 @@ public class PowerShellHostTests
             "result.Stderr instead of unwinding silently past the drain " +
             "(RC-10.3a Layer 1)");
 
-        // Load-bearing pre-fix check: the unique tag is ONLY emitted by the
-        // new InvokeAsync diagnostic path. Pre-fix, the existing drain
-        // appends raw ErrorRecord.ToString() without any framing — so this
-        // fails until Layer 1 lands.
+        // The framed prefix detects the new diagnostic path; the old raw ErrorRecord.ToString() drain cannot satisfy it.
         result.Stderr.Should().Contain("[RC103a:Stream]",
             "the RC-10.3a Layer 1 drain MUST tag each Streams.Error record " +
             "it appends with the [RC103a:Stream] frame so they're greppable " +
@@ -1148,13 +913,8 @@ public class PowerShellHostTests
             "so the source of the diagnostic is unambiguous in logs");
     }
 
-    /// <summary>
-    /// RC-10.3a test seam: opens a bare default runspace (no Hyper-V module
-    /// import, no Get-VMHost probe) so InvokeAsync can be exercised on
-    /// machines without the Hyper-V role installed. The production probe
-    /// requires Hyper-V availability — we deliberately bypass it here
-    /// because the RC-10.3a fix is module-agnostic.
-    /// </summary>
+    /// <summary>A bare runspace bypasses Hyper-V import/probing so module-independent InvokeAsync diagnostics can run without the role
+    /// installed.</summary>
     private sealed class BareRunspaceHost : PowerShellHost
     {
         public BareRunspaceHost(ILogger<PowerShellHost> logger) : base(logger) { }
@@ -1168,64 +928,19 @@ public class PowerShellHostTests
         }
     }
 
-    // ─── RC-11.8 — force STA apartment on hosted Windows PowerShell 5.1 runspace ─
-    //
-    // Build #18 (RC-11.5b-diag) hosted-runspace differentiator snapshot proved
-    // the LF-D7 `Get-VM : Value cannot be null. Parameter name: name` failure
-    // inside `New-PSSession -VMId <Guid>`'s internal `Get-VM -Id <guid>` call
-    // has EXACTLY ONE discriminator versus a working stock PS5.1 console:
-    //
-    //     [RC11.5b:T+280ms] DIAG-APARTMENT MTA   ← MCP-hosted runspace (FAILS)
-    //                       vs. STA in stock PS5.1 console (WORKS in harness)
-    //
-    // The Hyper-V `ParameterResolvers.GetServers` →
-    // `Server.GetServer(name, credential)` proxy requires STA to talk to the
-    // local WMI infrastructure. Under MTA, name resolves to null →
-    // ArgumentNullException → VirtualizationException → `Get-VM` fails →
-    // `New-PSSession -VMId` fails. Stock PS5.1 console is STA by default;
-    // hosted runspaces created by RunspaceFactory default to MTA.
-    //
-    // RC-11.8's fix forces ApartmentState=STA on the PS5.1 runspace BEFORE
-    // `runspace.Open()` (the Runspace properties are only settable in the
-    // BeforeOpen state). This literal-scan test pins the assignment in
-    // `OpenWindowsPowerShell51` so a future refactor cannot silently revert
-    // the apartment back to MTA.
+    // Hosted PS5.1 defaults to MTA, unlike the working stock STA console. Hyper-V GetServers/GetServer needs STA for local WMI; MTA yielded
+    // a null-name exception inside New-PSSession's Get-VM call. Pin STA before Open(), while runspace properties remain settable, to
+    // prevent regression.
     [Fact]
     public void OpenWindowsPowerShell51_ForcesStaApartmentForHyperVWmiProxyCompatibility()
     {
-        // Resolve src/HyperV.Mcp.Server/Infrastructure/PowerShellHost.cs by
-        // walking up from the test assembly's BaseDirectory until we find the
-        // repo root (the directory that contains the `src` folder).
-        string baseDir = AppContext.BaseDirectory;
-        DirectoryInfo? cursor = new DirectoryInfo(baseDir);
-        string? sourcePath = null;
-        while (cursor is not null)
-        {
-            var candidate = Path.Combine(
-                cursor.FullName,
-                "src",
-                "HyperV.Mcp.Server",
-                "Infrastructure",
-                "PowerShellHost.cs");
-            if (File.Exists(candidate))
-            {
-                sourcePath = candidate;
-                break;
-            }
-            cursor = cursor.Parent;
-        }
-
-        sourcePath.Should().NotBeNull(
-            "RC-11.8: literal-scan test must be able to locate " +
-            "src/HyperV.Mcp.Server/Infrastructure/PowerShellHost.cs by walking " +
-            "up from the test assembly's BaseDirectory.");
+        var sourcePath = Path.Combine(TestPaths.RepositoryRoot(),
+            "src", "HyperV.Mcp.Server", "Infrastructure", "PowerShellHost.cs");
+        File.Exists(sourcePath).Should().BeTrue($"the source guard requires '{sourcePath}'.");
 
         string source = File.ReadAllText(sourcePath!);
 
-        // Anchor the search to the OpenWindowsPowerShell51 METHOD DEFINITION
-        // (not earlier doc-comment / cref mentions of the same identifier) so
-        // the subsequent IndexOf calls scan only the method body, not the
-        // unrelated `runspace.Open();` call sites in TryOpenPowerShell7 etc.
+        // Anchor on the method definition, not comment/cref mentions or unrelated runspace.Open() calls.
         int methodIdx = source.IndexOf(
             "private Runspace OpenWindowsPowerShell51(",
             StringComparison.Ordinal);
@@ -1234,16 +949,12 @@ public class PowerShellHostTests
             "(`private Runspace OpenWindowsPowerShell51(...)`) must exist in " +
             "PowerShellHost.cs.");
 
-        // Find the method body's terminating `}` by scanning forward from the
-        // method signature for the first `private` (or end of file) — close
-        // enough for the literal-scan style. We just need a window that
-        // unambiguously contains the runspace.Open() call.
+        // The next private member or EOF bounds this literal-scan window closely enough to isolate runspace.Open().
         int openIdx = source.IndexOf(
             "runspace.Open();", methodIdx, StringComparison.Ordinal);
         openIdx.Should().BeGreaterThan(-1,
             "RC-11.8: OpenWindowsPowerShell51 must still call runspace.Open().");
 
-        // ── 1. ApartmentState = STA assignment must be present, BEFORE Open(). ──
         int apartmentIdx = source.IndexOf(
             "runspace.ApartmentState = System.Threading.ApartmentState.STA",
             methodIdx,
@@ -1267,7 +978,6 @@ public class PowerShellHostTests
             "BeforeOpen, the property is read-only and assignment throws " +
             "InvalidRunspaceStateException.");
 
-        // ── 2. ThreadOptions = UseNewThread assignment must be present. ──
         int threadOptsIdx = source.IndexOf(
             "PSThreadOptions.UseNewThread", methodIdx, StringComparison.Ordinal);
         threadOptsIdx.Should().BeGreaterThan(-1,
@@ -1285,29 +995,13 @@ public class PowerShellHostTests
 
     }
 
-    // ─── RC-11.10 — $PSDefaultParameterValues injection (LF-D7 cure) ──────
-    //
-    // Smoke probe #7 (full 6KB stderr, 2026-04-30) proved the failing
-    // `Get-VM -Name $args` is internally synthesized by `New-PSSession
-    // -VMName/-VMId`'s parameter resolver and runs WITHOUT -ComputerName,
-    // hitting the LF-D7 Server.GetServer(name=null) bug. The SessionStore
-    // script's local injection (also tagged RC-11.10) cures the per-session
-    // create path; appending the SAME injection to Ps51InitializationScript
-    // makes -ComputerName localhost a process-wide invariant for ALL
-    // subsequent Get-VM/New-PSSession invocations in the OOP runspace —
-    // belt-and-suspenders coverage in case any callsite forgets the
-    // SessionStore script's local injection.
-    //
-    // The init script runs IMMEDIATELY after Import-Module Hyper-V, so the
-    // defaults must appear AFTER the import in source order (otherwise the
-    // module isn't loaded yet and the cmdlet-qualified key 'Get-VM:...'
-    // won't bind).
+    // New-PSSession synthesizes Get-VM without ComputerName, triggering the null-server bug. Process-wide defaults complement
+    // SessionStore's local injection if a caller omits it. Set defaults after Import-Module Hyper-V so the cmdlet-qualified keys bind.
     [Fact]
     public void Ps51InitializationScript_HasRc1110PSDefaultParameterValuesInjection()
     {
         string script = PowerShellHost.Ps51InitializationScript;
 
-        // ── 1. Both default-parameter-value entries must be present. ──
         script.Should().Contain(
             "$PSDefaultParameterValues['Get-VM:ComputerName']       = 'localhost'",
             "RC-11.10: Ps51InitializationScript must inject Get-VM:Computer" +
@@ -1324,7 +1018,6 @@ public class PowerShellHostTests
             "New-PSSession:ComputerName='localhost' so the cmdlet itself " +
             "binds the same -ComputerName default.");
 
-        // ── 2. Additive form (preserves any defaults set upstream). ──
         script.Should().Contain(
             "if (-not $PSDefaultParameterValues) { $PSDefaultParameterValues = @{} }",
             "RC-11.10: Ps51InitializationScript must use the ADDITIVE form " +
@@ -1332,11 +1025,7 @@ public class PowerShellHostTests
             "whole hashtable, so any defaults set upstream in the runspace " +
             "are preserved.");
 
-        // ── 3. Ordering: defaults must be AFTER Import-Module Hyper-V. ──
-        // The cmdlet-qualified default key 'Get-VM:ComputerName' only binds
-        // once the Hyper-V module's Get-VM cmdlet is resolvable. Setting it
-        // before Import-Module would silently no-op for module-resolved
-        // cmdlets.
+        // Get-VM:ComputerName binds only after Hyper-V import; setting it earlier silently does nothing for module-resolved cmdlets.
         int importIdx = script.IndexOf(
             "Import-Module -Name 'Hyper-V' -ErrorAction Stop", StringComparison.Ordinal);
         int defaultsIdx = script.IndexOf(

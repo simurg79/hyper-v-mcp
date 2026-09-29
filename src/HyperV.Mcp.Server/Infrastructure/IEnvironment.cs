@@ -1,34 +1,22 @@
 namespace HyperV.Mcp.Server.Infrastructure;
 
-/// <summary>
-/// Thin seam over <see cref="System.Environment"/> for reading process environment
-/// variables. Introduced to make the script-dump diagnostic in
-/// <see cref="PowerShellExecutor"/> deterministically testable without mutating
-/// process-global state.
-///
-/// See /myplans/operational/script-dump-test-isolation/script-dump-test-isolation-design.md
-/// — Decisions TI-D1, TI-D9, TI-D10. "Internal-only" in the design refers to
-/// "not MCP-user-facing"; the interface is <see langword="public"/> so DI
-/// registration in <c>Program.cs</c> can resolve it.
-/// </summary>
+/// <summary>Environment seam for deterministic PowerShellExecutor script-dump tests without process-global mutation.
+/// See /myplans/operational/script-dump-test-isolation/script-dump-test-isolation-design.md — TI-D1, TI-D9, TI-D10.
+/// Public for Program.cs DI registration; "internal-only" means not MCP-user-facing.</summary>
 public interface IEnvironment
 {
-    /// <summary>
-    /// Returns the value of the named environment variable, or <see langword="null"/>
-    /// if it is not defined. Pass-through to
-    /// <see cref="System.Environment.GetEnvironmentVariable(string)"/>.
-    /// </summary>
+    /// <summary>Returns the process environment value, or null if undefined.</summary>
     string? GetEnvironmentVariable(string name);
+    void SetEnvironmentVariable(string name, string? value);
 }
 
-/// <summary>
-/// Default <see cref="IEnvironment"/> implementation that delegates directly to
-/// <see cref="System.Environment.GetEnvironmentVariable(string)"/>. Stateless,
-/// no logging, no fields — a pure pass-through (TI-D9).
-/// </summary>
+/// <summary>TI-D9: stateless pass-through to System.Environment.GetEnvironmentVariable, without logging.</summary>
 public sealed class SystemEnvironment : IEnvironment
 {
     /// <inheritdoc />
     public string? GetEnvironmentVariable(string name)
         => System.Environment.GetEnvironmentVariable(name);
+
+    public void SetEnvironmentVariable(string name, string? value)
+        => System.Environment.SetEnvironmentVariable(name, value, EnvironmentVariableTarget.Process);
 }

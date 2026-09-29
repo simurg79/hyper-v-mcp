@@ -36,9 +36,10 @@ This MCP server enables AI agents (Roo, Claude Desktop, GitHub Copilot, Cursor, 
 | `vm_copy_file` | Copy file/directory from host to guest | 1 |
 | `vm_destroy` | Stop + remove VM + delete VHDX | 1 |
 | `vm_list` | Query existing VMs by name pattern | 1 |
+| `vm_find_by_name` | Resolve VM IDs and states by exact name, including untagged VMs | 2 |
 | `vm_status` | Non-blocking VM status query | 2 |
 | `vm_get_file` | Retrieve file from guest to host | 2 |
-| `vm_wait_ready` | Block until VM reaches target readiness state | 2 |
+| `vm_wait_ready` | Confirm fresh authenticated guest access for the resolved identity | 2 |
 | `vm_run_script` | Execute multi-line script on guest | 2 |
 | `vm_start` | Start a stopped VM | 2 |
 | `vm_stop` | Stop a VM (graceful or force) | 2 |
@@ -54,6 +55,55 @@ This MCP server enables AI agents (Roo, Claude Desktop, GitHub Copilot, Cursor, 
 | `vm_create_base_image` | Generalize an installed VM into a reusable base VHDX (sysprep + checkpoint-merge + copy) | 3 |
 
 > **Note on `vm_create` performance and timeout.** `vm_create` verifies the base VHDX with SHA-256 before and after the differencing clone (≈ 2 s/GB per pass on a cold page cache). A persisted `<base>.vhdx.sha256` sidecar collapses the pre-hash to a stat-tuple match on subsequent runs. The default server-side request envelope is **120 s**; override via `HYPERV_MCP_VM_CREATE_TIMEOUT_SECONDS` (range 60–600). Pass `verifyBaseImageHash: false` per call to skip the hash check entirely (see the tool description for the trade-off). The full env-var reference was relocated to the operator-local roo-vault at `myplans/operational/environment-variables.md` (not tracked in this repo).
+
+### Guest-login readiness: `vm_wait_ready`
+
+`vm_wait_ready` observes a supported Windows or Linux guest without changing VM configuration,
+power state, accounts, or guest files. Success means **this call freshly authenticated the resolved
+identity and positively completed a read-only guest operation**. Running state and a healthy
+heartbeat are only prefilters, never proof of guest-login readiness. Existing host selection and
+unsupported or undetermined guest-routing refusals remain authoritative; no transport is guessed.
+Use `vm_status` when only power state is needed.
+
+Inputs: required `vmId`, optional `hostId`, `username`, `password`, and `timeoutSeconds`.
+Each supplied credential field takes precedence over its corresponding default,
+`HYPERV_MCP_VM_USERNAME` or `HYPERV_MCP_VM_PASSWORD`. Without a usable pair the result is
+`MISSING_CREDENTIALS`, not heartbeat-only success. Use the identity intended for subsequent guest work.
+Credentials are not returned or durably stored by the readiness wait.
+
+`timeoutSeconds` defaults to **300**, must be positive, and accepts **1** without raising it to a
+larger minimum. Zero and negative values return `INVALID_PARAMETER`.
+The single elapsed wait budget starts before concurrency waits and is checked before every new
+functional step or retry. **It is not a hard whole-call deadline.** Host preparation, waiting for
+access, an already-started operation, and required cleanup can delay the response beyond the budget.
+Expiry does not interrupt an in-flight step; no next step starts after expiry. A final authenticated
+confirmation begun with time remaining may succeed at or after expiry. Cleanup runs on every exit,
+and its duration alone does not invalidate confirmation. Explicit caller cancellation still prevents
+success, including when confirmation succeeds before cleanup finishes. Independent access limits and
+concurrency refusals remain in force. Requested and effective budgets are reported in uncertain failures.
+
+Success retains the existing VM-information result shape. It is **point-in-time evidence only**:
+it does not reserve or return a session, guarantee the next command, another account's access,
+desktop login, application or installation completion, network availability, or arbitrary privileged
+commands. Handle each subsequent guest operation's own result. Ordinary command and transfer
+credential-rejection and retry behavior is unchanged.
+
+Failures retain the existing failure envelope without a successful readiness payload:
+
+- **`READINESS_NOT_REACHED` — budget exhausted:** guest-login readiness could not be determined.
+  Inspect the VM and last safe observation; retry if further boot progress may help.
+- **Credential rejection observed:** the same uncertain code is returned if no later attempt confirms
+  readiness. The message identifies the attempted username. **Verify credentials for the image, or
+  wait and retry after a recent start**; an ambiguous rejection does not prove which cause applies.
+- **`READINESS_NOT_REACHED` — observation failed:** guest-login readiness could not be reliably checked.
+  The message distinguishes this from budget exhaustion, supplies a safe cause or states it is unknown,
+  and identifies the VM. Correct an identified access problem before retrying.
+- Missing VM, invalid input, unsupported host or guest, undetermined routing, and concurrency refusals
+  retain their specific failure meanings. Caller cancellation retains the existing cancellation outcome.
+
+None of the uncertain outcomes proves the guest will never become ready. Do not begin dependent work
+on an uncertain result. Even valid credentials may require materially longer than the former
+heartbeat-only wait and may consume the whole budget; no fixed boot duration or minimum delay is implied.
 
 ## Prerequisites
 
@@ -83,6 +133,19 @@ This MCP server enables AI agents (Roo, Claude Desktop, GitHub Copilot, Cursor, 
   }
 }
 ```
+
+## Process Lifecycle and Exit Codes
+
+The server is bound to the lifetime of its stdio peer: when the MCP client disconnects (stdin EOF) or the transport faults, the server stops the host and waits up to **5 seconds** for the host and its DI container to finish disposing. A surviving process would pin the PowerShell runspace and session state, so the next-spawned server cannot reach the rotated stdio pipes and every call fails with "Not connected" until the stale process is killed.
+
+| Exit code | Meaning |
+|-----------|---------|
+| `0` | Shutdown and disposal completed within the grace period. |
+| `3` | Disposal hung past the grace period, or shutdown failed — the process was force-exited. Supervisors and CI wrappers must treat `3` as an unclean stop, not a crash of the tool call that preceded it. |
+
+Once the peer disconnects, the grace period is armed regardless of what else has already requested a stop; if a shutdown is already in progress by another route (e.g. Ctrl+C), that route keeps ownership of the stop reason but a hang still force-exits with `3`. The grace period is a fixed build-time constant — there is no environment variable or CLI flag to tune it.
+
+The server does not require the launcher to pass `COMPUTERNAME`, `windir`, or `SystemRoot`: any that are missing are recovered from the operating system at startup. Startup is bounded at **120 seconds** from process launch; if it does not complete, a report naming the unfinished stage is written to stderr and the same detail is available in the `phase2Host` block of `vm_diag`. A timeout report does not mean the unfinished work was cancelled — recovery is a server restart.
 
 ## Project Structure
 
@@ -114,7 +177,7 @@ src/
 │   │   ├── ErrorCodes.cs
 │   │   └── (CommandResult, FileTransferResult, CheckpointResult, OsInstallResult, ImageInfo, VmInfo)
 │   └── Tools/
-│       └── VmTools.cs              ← single consolidated `[McpServerToolType]` with all 22 implemented tool wrappers
+│       └── VmTools.cs              ← single consolidated `[McpServerToolType]` with all 22 implemented tool wrappers (see [/myplans/mcp-interface/mcp-interface-design.md](myplans/mcp-interface/mcp-interface-design.md))
 │
 tests/
 ├── HyperV.Mcp.Server.Tests/
@@ -123,9 +186,23 @@ tests/
 │   ├── Operational/
 │   ├── Remoting/
 │   └── Runtime/
+
+myplans/                         ← Plan/design documents (24 markdown files; abbreviated below)
+├── design.md                          ← Top-level design document
+├── design-review.md                   ← Design review notes
+├── execution-plan.md
+├── phase1-manual-test-plan.md
+├── remoting/         …                ← Focus areas with per-component design docs
+├── vm-management/    …
+├── security/         …
+├── execution/        …
+├── operational/      …
+└── mcp-interface/    …
 ```
 
-## Installing Windows from ISO (`vm_os_install`)
+> **Note:** `myplans/` in this repository is a local symlink/vault-backed location (the canonical plan content lives in an external Roo vault, not committed to this repo). The plan-document links elsewhere in this README resolve only in worktrees that have the `myplans` symlink configured locally; on the GitHub web viewer or in plain clones without the vault set up, those links will not resolve.
+
+## Installing an OS from ISO (`vm_os_install`)
 
 The `vm_os_install` tool creates a new VM and installs Windows 11 from an ISO image in a single call. It handles all orchestration automatically: VM creation, hardware configuration (Gen 2, TPM 2.0, Secure Boot, UEFI), disk partitioning via DISM, unattended answer file generation, installation monitoring, post-install bootstrap, and cleanup.
 
@@ -165,6 +242,35 @@ This creates a 4-vCPU, 8 GB RAM, 127 GB disk Windows 11 Pro VM, installs the OS 
 - **Product keys**: When no `productKey` is provided, the server uses a well-known Generic Volume License Key (GVLK) for the selected edition. These are Microsoft-published KMS client setup keys that allow installation without activation.
 - **Test VMs**: VMs created for live integration testing (e.g., `win11-mcp-test`) should be kept running. The single source of truth for lab credentials, env-var contract, VMs, and storage layout was relocated to the operator-local roo-vault at `myplans/operational/lab-environment.md` (not tracked in this repo). The test-suite README at [`tests/HyperV.Mcp.Server.Tests/README.md`](tests/HyperV.Mcp.Server.Tests/README.md) carries the same breadcrumb.
 
+### Installing Ubuntu Server 24.04
+
+`vm_os_install` also installs Ubuntu Server 24.04 from a `casper`-based live-server ISO. Pass the initial login user via `guestUsername` (default `ubuntu`) and its password via `adminPassword`; the server creates a Generation 2 / Secure-Boot-off VM and drives cloud-init autoinstall. `windowsEdition` and `productKey` are ignored for this target.
+
+**The ISO must be autoinstall-prepared.** A stock `ubuntu-24.04-live-server-amd64.iso` carries no `autoinstall` kernel boot token, so Ubuntu's subiquity installer stops at a "Confirmation is required to continue" prompt that nothing can answer. Prepare the media once, offline, with [`scripts/prepare-ubuntu-autoinstall-iso.py`](scripts/prepare-ubuntu-autoinstall-iso.py) and pass its output as `isoPath`:
+
+```bash
+python scripts/prepare-ubuntu-autoinstall-iso.py \
+    --source C:\ISOs\ubuntu-24.04-live-server-amd64.iso \
+    --output C:\ISOs\ubuntu-24.04-autoinstall-amd64.iso
+```
+
+The script needs `xorriso` (via WSL on Windows); it never modifies the source ISO. See its module docstring for the full contract.
+
+#### `LINUX_PRECONDITION_UNMET` — media is not autoinstall-capable
+
+The server inspects Ubuntu media **before** creating the VM, attaching media, or starting any wait. If the `autoinstall` boot token is absent — or its presence cannot be confirmed — the call fails within seconds with `LINUX_PRECONDITION_UNMET`, naming the supplied ISO path and pointing at the preparation script. No VM is created. This refusal is deliberately fail-closed and **is not bypassable with `skipPreflight: true`**. The fix is always the same: run the preparation script and retry with the prepared ISO.
+
+#### `LINUX_INSTALL_TIMEOUT` — triage context
+
+If an install still exceeds `timeoutMinutes`, the error message and its structured `details` carry two extra facts for triage without host access:
+
+- the ISO path actually attached to the VM's primary DVD drive, read from the VM (never echoed back from the request), and
+- the guest completion-channel state, as one of *available but no signal*, *unavailable*, or *undetermined*.
+
+Either item is reported as undetermined rather than guessed when it cannot be read. Both survive credential sanitization.
+
+For the authoritative contract, see the [ISO installation spec](/myplans/vm-management/iso-installation/iso-installation-spec.md) and the [Ubuntu media capability & timeout diagnostics design](/myplans/vm-management/iso-installation/ubuntu-media-capability-and-timeout-diagnostics-design.md).
+
 ## Diagnostics
 
 For diagnosing PowerShell-related issues (PS Direct / WinRM script generation, credential handling, autoload failures), the server supports an opt-in **script-dump** mode that writes the exact `.ps1` handed to `pwsh` (with credentials masked) to a directory of your choosing and preserves the `%TEMP%` original for manual rerun.
@@ -184,19 +290,49 @@ $env:HYPERV_MCP_DUMP_PS_SCRIPTS = "C:\hvmcp-debug"
 - **OS-install scripts (`vm_os_install`) are excluded from dumping in v1** because the v1 masker cannot redact their variable-backed credentials and unattended-XML password nodes. Setting the env var has no effect for that one code path.
 - If the dump directory cannot be created, the server logs a Warning and behaves as if the feature were disabled for that call (the `%TEMP%` script is deleted as normal). If the directory exists but a write fails mid-run, the server logs a Warning and **preserves the `%TEMP%` script** so you can still rerun manually. Dump-side failures never affect the underlying tool call.
 
-The full activation, masking, and security contract — including a recommended Windows ACL recipe for the dump directory — is maintained with the project's internal design notes. **Treat the dump directory as sensitive.** The `.gitignore` recommendation only applies if the dump directory is inside a repository checkout; for production diagnostic use, prefer a path **outside any repo** (e.g., `C:\hvmcp-debug` or `%TEMP%\hvmcp-debug`).
+See the [Script-Dump Diagnostic Design](/myplans/operational/script-dump/script-dump-design.md) for the full activation, masking, and security contract, including a recommended Windows ACL recipe for the dump directory. **Treat the dump directory as sensitive.** The `.gitignore` recommendation only applies if the dump directory is inside a repository checkout; for production diagnostic use, prefer a path **outside any repo** (e.g., `C:\hvmcp-debug` or `%TEMP%\hvmcp-debug`).
 
 ## Known Issues
 
 | Issue | Detail | Workaround |
 |-------|--------|------------|
-| pwsh 7+ Hyper-V probe fails on Windows 11 26200+ | `Get-VM` throws "Value cannot be null" when spawned non-interactively in pwsh due to a WMI provider bug on recent Windows 11 Insider builds. The server detects this and falls back to `powershell.exe` 5.1 automatically. | No action needed — fallback is automatic. Tracked as #26. Will resolve when Microsoft fixes the WMI provider. |
-| Smoke startup failure: `Get-VMHost` probe `CommandNotFoundException: 'Select-Object'` | The MCP server's startup Hyper-V probe runs `Get-VMHost \| Select-Object -ExpandProperty Name` inside the in-proc PowerShell 7 (Core) runspace. On a freshly-built server `bin/`, the post-build `StripBundledMicrosoftPowerShellModules` target in [`HyperV.Mcp.Server.csproj`](src/HyperV.Mcp.Server/HyperV.Mcp.Server.csproj) uses an over-broad `Microsoft.PowerShell.*` glob that removes `Microsoft.PowerShell.Utility` (which provides `Select-Object`) along with the intended `Microsoft.PowerShell.Security`. The Core runspace then cannot resolve `Select-Object` because the only remaining copy on disk is the `Desktop`-edition module under `C:\Windows\System32\WindowsPowerShell\v1.0\`, which Core correctly refuses to load. **This is not an OS-version issue** — it reproduces on any host where the server is launched against a freshly-built, stripped `bin/`. | **No end-user workaround.** The fix lives in the build target and is tracked in #66. (Developers can manually restore `Microsoft.PowerShell.Utility` to `bin\Debug\net8.0-windows\runtimes\win\lib\net8.0\Modules\` after each build, but this is fragile and not advisable.) |
+| pwsh 7+ Hyper-V probe fails on Windows 11 26200+ | `Get-VM` throws "Value cannot be null" when spawned non-interactively in pwsh due to a WMI provider bug on recent Windows 11 Insider builds. The server detects this and falls back to `powershell.exe` 5.1 automatically. | No action needed — fallback is automatic. Tracked as [#26](https://github.com/simurg79/hyper-v-mcp-server/issues/26). Will resolve when Microsoft fixes the WMI provider. |
+
+### Smoke startup failure: `Get-VMHost` probe `CommandNotFoundException: 'Select-Object'`
+
+The MCP server's startup Hyper-V probe runs `Get-VMHost | Select-Object -ExpandProperty Name` inside the in-proc PowerShell 7 (Core) runspace.
+On a freshly-built server `bin/`, the post-build `StripBundledMicrosoftPowerShellModules` target in [`HyperV.Mcp.Server.csproj`](src/HyperV.Mcp.Server/HyperV.Mcp.Server.csproj) uses an over-broad `Microsoft.PowerShell.*` glob that removes `Microsoft.PowerShell.Utility` (which provides `Select-Object`) along with the intended `Microsoft.PowerShell.Security`.
+The Core runspace then cannot resolve `Select-Object` because the only remaining copy on disk is the `Desktop`-edition module under `C:\Windows\System32\WindowsPowerShell\v1.0\`, which Core correctly refuses to load.
+**This is not an OS-version issue** — it reproduces on any host where the server is launched against a freshly-built, stripped `bin/`.
+
+**No end-user workaround.** The fix lives in the build target and is tracked in [#66](https://github.com/simurg79/hyper-v-mcp-server/issues/66). (Developers can manually restore `Microsoft.PowerShell.Utility` to `bin\Debug\net8.0-windows\runtimes\win\lib\net8.0\Modules\` after each build, but this is fragile and not advisable.)
 
 > For operational failure modes (timeouts, partially-created resources, transient PowerShell faults), the troubleshooting guide was relocated to the operator-local roo-vault at `myplans/operational/troubleshooting.md` (not tracked in this repo). This table tracks build/OS-level known issues only.
 
+## Documentation Map
+
+All design memory, implementation plans, and architectural decisions live under the canonical `myplans/` root, which is **operator-local and not tracked in this repository** (`.gitignore` entry `myplans`). The paths below are therefore locators for a configured developer workspace, deliberately rendered as plain paths rather than links so they do not present as dead links when browsing on GitHub.
+
+### Top-level
+
+- `myplans/index.md` — Hierarchy + conventions for the entire `myplans/` tree.
+- `myplans/design.md` — Full architecture: execution channels, bootstrap state machine, tool contracts, security model, MVP plan.
+- `myplans/design-review.md` — Review findings and enhancement recommendations.
+- `myplans/operational/test-plans/phase2-smoke-test-plan.md` — Live MCP smoke procedure for the in-proc PowerShell SDK runspace + `SessionStore`. Appendix A indexes the LF-D7 Probe ladder #1 → #8 and the `diagVersion` v6 → v10 history.
+
+### Remoting focus area
+
+- `myplans/remoting/remoting-design.md` — REM-D1..REM-D7 (incl. REM-D7 = LF-D7 / RC-11.10 cure cross-reference).
+- `myplans/remoting/powershell-direct/powershell-direct-design.md` — PSD-D1..PSD-D10. **PSD-D9 / PSD-D10 are the LF-D7 cure** (`$PSDefaultParameterValues` injection, mirrored at runspace open and PSSession creation).
+- `myplans/remoting/powershell-direct/lf-d7-rc-ladder-investigation.md` — Full hypothesis ladder, falsified hypotheses preserved as durable evidence.
+- `myplans/remoting/powershell-direct/wmi-bug-investigation.md` — Root-cause analysis for the `Value cannot be null. Parameter name: name` family. Part B is the RC-11.10 cure narrative.
+- `myplans/remoting/powershell-direct/diagnostic-seam-retention-roadmap.md` — KEEP / RETIRE / DEFER for the 6 RC-1..RC-11.9 diagnostic seams.
+- `myplans/remoting/session-management/session-management-design.md` — SM-D1..SM-D8 (incl. SM-D8 = `SessionStore` mirror of the LF-D7 cure).
+
+### Diagnostics focus area
+
+- `myplans/diagnostics/diagnostics-design.md` — `vm_echo` / `vm_diag` tool surface, the `diagVersion` literal convention, and the smoke-gate convention (DIAG-D4 / DIAG-D5).
+
 ## License
 
-Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for the full license text.
-
-Copyright 2026 simurg79
+Private — All rights reserved.

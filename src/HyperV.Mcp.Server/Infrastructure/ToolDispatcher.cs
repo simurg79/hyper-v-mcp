@@ -7,59 +7,28 @@ using Microsoft.Extensions.Logging.Abstractions;
 
 namespace HyperV.Mcp.Server.Infrastructure;
 
-/// <summary>
-/// Dispatches MCP tool calls to the appropriate handler.
-/// See /myplans/mcp-interface/mcp-interface-design.md — MCP-D1: Attribute-based tool registration.
-/// See /myplans/mcp-interface/mcp-interface-design.md — MCP-D6: Exceptions caught and wrapped.
-///
-/// Design decisions:
-/// - All 19 catalog tools are pre-registered at construction time.
-///   This ensures GetRegisteredTools() and IsRegistered() reflect the full catalog
-///   immediately, matching /myplans/mcp-interface/mcp-interface-design.md — Complete Tool Catalog.
-/// - P0 tools (vm_echo, vm_create, vm_start, vm_stop, vm_destroy, vm_list,
-///   vm_status, vm_run_command, vm_copy_file) have real implementations that
-///   delegate to infrastructure services via DI.
-///   See /myplans/execution-plan.md — Stage 1.5: P0 Tool Handlers.
-/// - P1 tools (vm_list_images, vm_run_script, vm_get_file, vm_restart,
-///   vm_wait_ready, vm_checkpoint, vm_cleanup_orphans, vm_os_install) have
-///   real handler implementations.
-/// - P2 tools have stub handlers that throw NotImplementedException,
-///   to be replaced as each tool is implemented in later subtasks.
-/// - Unknown tool dispatch returns a TOOL_NOT_FOUND error response (MCP-D6),
-///   never throwing an exception to the caller.
-/// - CancellationToken is checked before handler invocation for fast-fail on
-///   already-cancelled requests. See /myplans/execution/commands/commands-design.md — Timeout and Cancellation.
-/// - Infrastructure services are injected via constructor DI rather than being
-///   created internally, enabling testability and proper lifecycle management.
-///   See /myplans/execution-plan.md — Stage 1.5: Refactor ToolDispatcher for DI.
-///
-/// Lock ordering (Issue 3 fix):
-/// Per /myplans/operational/concurrency/concurrency-design.md — CC-D1 through CC-D7:
-/// 1. Global slot (outermost) — always acquired first
-/// 2. Per-host lock — for lifecycle operations that affect host-level resources
-/// 3. Per-VM lock (innermost) — for operations that affect a specific VM
-///
-/// Lifecycle operations (create, start, stop, destroy, checkpoint): global + host + VM
-/// Read-only operations (list, status): global only
-/// Execution operations (run_command, copy_file): global + VM
-/// Readiness polling (wait_ready): global + VM
-/// </summary>
+/// <summary>Registers the full catalog at construction so discovery is immediately complete; constructor DI owns service lifetimes.
+/// Unknown tools return TOOL_NOT_FOUND; pre-cancelled requests fail before invocation. P0/P1 handlers delegate to services; P2 stubs are deferred.
+/// Lock order: global, host, VM. Lifecycle uses all three; read-only uses global; execution and readiness use global + VM.</summary>
 public class ToolDispatcher : IToolDispatcher
 {
     private const int VmDiagPerTestTimeoutSeconds = 10;
     private const int VmDiagOutputPreviewLength = 500;
     private static readonly HashSet<string> AllowedCheckpointActions = new() { "create", "restore", "list", "delete" };
 
-    // VC-D12 (Issue #170): default request timeout for `vm_create` — 120s,
-    // env-overridable via `HYPERV_MCP_VM_CREATE_TIMEOUT_SECONDS` in the
-    // inclusive range 60..600. Covers a ~30 GB base on a cold OS page cache
-    // (~67 s post-hash + ~7 s PowerShell + ~46 s headroom). The PowerShell-
-    // internal 600 s budget is unchanged; only the transport-level CTS is
-    // widened to give synchronous SHA verification room to fit.
+    // The 120s request budget fits a cold ~30GB base (~67s hash + ~7s PowerShell + ~46s headroom).
+    // HYPERV_MCP_VM_CREATE_TIMEOUT_SECONDS accepts 60–600s; the inner PowerShell budget remains 600s.
     internal const int VmCreateTimeoutSecondsDefault = 120;
     internal const int VmCreateTimeoutSecondsMin = 60;
     internal const int VmCreateTimeoutSecondsMax = 600;
     internal const string VmCreateTimeoutEnvVar = "HYPERV_MCP_VM_CREATE_TIMEOUT_SECONDS";
+
+    /// <summary>
+    /// Extra transport slack on the password path so the inner readiness window and its own
+    /// grace expire before the transport deadline does, keeping the preserve-the-VM outcome
+    /// reachable instead of collapsing into cancellation rollback.
+    /// </summary>
+    internal const int PasswordPathTransportSlackSeconds = 120;
 
     private readonly Dictionary<string, Func<Dictionary<string, object?>, CancellationToken, Task<McpToolResponse>>> _handlers = new();
     private readonly IErrorMapper _errorMapper;
@@ -71,19 +40,19 @@ public class ToolDispatcher : IToolDispatcher
     private readonly IConcurrencyGate _concurrencyGate;
     private readonly IPowerShellExecutor _psExecutor;
     private readonly IPowerShellDirectChannel _channel;
-    private readonly IPowerShellHost? _psHost;
-    private readonly IBaseImageHashCache? _baseImageHashCache; // Issue #169 / VC-D7
-    private readonly ServerOptions _options;
-    private readonly ILogger<ToolDispatcher> _logger;
 
     /// <summary>
-    /// Creates a new ToolDispatcher with all infrastructure services injected via DI.
-    /// See /myplans/execution-plan.md — Stage 1.5: P0 Tool Handlers.
-    /// Issue #52, ST-6: <see cref="IPowerShellDirectChannel"/> is injected so that
-    /// <see cref="HandleDestroyAsync"/> can evict any persistent PSSession BEFORE
-    /// the VM is destroyed (SM-D7). The dispatcher does NOT take a direct dependency
-    /// on <c>ISessionStore</c> — the channel is the single facade.
+    /// Optional so existing positional fixtures keep compiling; production DI supplies the shared
+    /// singleton, which is what makes the vm_destroy hint eviction effective.
     /// </summary>
+    private readonly IGuestRoutingHintStore? _guestRoutingHintStore;
+    private readonly IPowerShellHost? _psHost;
+    private readonly IBaseImageHashCache? _baseImageHashCache;
+    private readonly ServerOptions _options;
+    private readonly ILogger<ToolDispatcher> _logger;
+    private readonly TimeProvider _readinessClock;
+
+    /// <summary>Inject the channel facade, not ISessionStore, so destroy can evict persistent sessions before removing the VM.</summary>
     public ToolDispatcher(
         IHyperVManager hyperVManager,
         ICommandExecutor commandExecutor,
@@ -97,8 +66,12 @@ public class ToolDispatcher : IToolDispatcher
         ServerOptions options,
         IPowerShellHost? psHost = null,
         ILogger<ToolDispatcher>? logger = null,
-        IBaseImageHashCache? baseImageHashCache = null)
+        IBaseImageHashCache? baseImageHashCache = null,
+        IGuestRoutingHintStore? guestRoutingHintStore = null,
+        TimeProvider? readinessClock = null)
     {
+        _readinessClock = readinessClock ?? TimeProvider.System;
+        _guestRoutingHintStore = guestRoutingHintStore;
         _hyperVManager = hyperVManager ?? throw new ArgumentNullException(nameof(hyperVManager));
         _commandExecutor = commandExecutor ?? throw new ArgumentNullException(nameof(commandExecutor));
         _fileTransferService = fileTransferService ?? throw new ArgumentNullException(nameof(fileTransferService));
@@ -108,22 +81,15 @@ public class ToolDispatcher : IToolDispatcher
         _concurrencyGate = concurrencyGate ?? throw new ArgumentNullException(nameof(concurrencyGate));
         _psExecutor = psExecutor ?? throw new ArgumentNullException(nameof(psExecutor));
         _channel = channel ?? throw new ArgumentNullException(nameof(channel));
-        // Issue #52 Phase 2 Gate 3 RC-1: optional IPowerShellHost dependency. When supplied
-        // (production DI wires it; many unit-test fixtures still pass null), the VM-state
-        // pre-flight in EnsureVmRunningAsync routes through the in-process PowerShell host
-        // instead of HyperVManager.GetVmStatusAsync — which would otherwise drag the legacy
-        // out-of-process PowerShellExecutor (writing hvmcp-*.ps1 temp scripts) onto every
-        // guest tool call, violating the PSD-D6 single-facade rule.
+        // Production injects the in-process host for VM-state preflight so guest calls do not spawn legacy PowerShell scripts.
+        // The dependency remains optional for existing fixtures.
         _psHost = psHost;
-        // Issue #169 / VC-D7: optional reference to the base-image hash cache so
+        // optional reference to the base-image hash cache so
         // vm_diag can surface its warm-up status without breaking existing test
         // fixtures that construct ToolDispatcher positionally.
         _baseImageHashCache = baseImageHashCache;
         _options = options ?? throw new ArgumentNullException(nameof(options));
-        // DIAG-D7 (#65): canonical structured-logging seam. ILogger<ToolDispatcher> is
-        // resolved from DI in production (Generic Host's default AddLogging registers
-        // the open-generic ILogger<T>). Fixtures that pass null get a NullLogger so
-        // the pre-existing test surface keeps working without a forced re-wire.
+        // Production DI supplies structured logging; NullLogger preserves fixtures without a logger.
         _logger = logger ?? NullLogger<ToolDispatcher>.Instance;
         RegisterAllCatalogTools();
     }
@@ -131,13 +97,11 @@ public class ToolDispatcher : IToolDispatcher
     /// <inheritdoc />
     public async Task<string> DispatchAsync(string toolName, Dictionary<string, object?> arguments, CancellationToken ct = default)
     {
-        // Fast-fail on already-cancelled tokens.
-        // See /myplans/execution/commands/commands-design.md — Timeout and Cancellation.
         ct.ThrowIfCancellationRequested();
 
         if (!_handlers.TryGetValue(toolName, out var handler))
         {
-            // Unknown tools produce a structured error response, not an exception (MCP-D6).
+            // Unknown tools produce a structured error response, not an exception.
             var errorResponse = McpToolResponse.Fail(
                 $"Tool '{toolName}' is not registered",
                 RuntimeErrorCodes.ToolNotFound);
@@ -146,7 +110,6 @@ public class ToolDispatcher : IToolDispatcher
 
         try
         {
-            // Check cancellation again before invoking the handler.
             ct.ThrowIfCancellationRequested();
 
             var response = await handler(arguments, ct);
@@ -154,12 +117,11 @@ public class ToolDispatcher : IToolDispatcher
         }
         catch (OperationCanceledException)
         {
-            // Propagate cancellation as-is per design contract.
             throw;
         }
         catch (Exception ex)
         {
-            // MCP-D6: Exceptions caught and wrapped — never propagated as MCP protocol errors.
+            // Exceptions caught and wrapped — never propagated as MCP protocol errors.
             var errorResponse = _errorMapper.MapException(ex);
             return JsonSerializer.Serialize(errorResponse);
         }
@@ -185,27 +147,9 @@ public class ToolDispatcher : IToolDispatcher
         return _handlers.Keys.ToList().AsReadOnly();
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // Tool Registration
-    // ═══════════════════════════════════════════════════════════════════
 
-    /// <summary>
-    /// Registers all 22 catalog tools (from <see cref="Models.ToolCatalog.AllTools"/>)
-    /// with their handler functions. All 22 tools have real handler implementations:
-    /// <list type="bullet">
-    ///   <item><description>P0 (10): vm_echo, vm_diag, vm_create, vm_start, vm_stop,
-    ///     vm_destroy, vm_list, vm_status, vm_run_command, vm_copy_file</description></item>
-    ///   <item><description>P1 (8): vm_list_images, vm_run_script, vm_get_file,
-    ///     vm_restart, vm_wait_ready, vm_checkpoint, vm_cleanup_orphans,
-    ///     vm_os_install</description></item>
-    ///   <item><description>P2 (3): vm_pause, vm_resume, vm_create_base_image</description></item>
-    ///   <item><description>Configuration (1): vm_configure</description></item>
-    /// </list>
-    /// See /myplans/mcp-interface/mcp-interface-design.md — Complete Tool Catalog.
-    /// </summary>
     private void RegisterAllCatalogTools()
     {
-        // P0 tools with real handlers
         _handlers["vm_echo"] = HandleEchoAsync;
         _handlers["vm_diag"] = HandleDiagAsync;
         _handlers["vm_create"] = HandleCreateAsync;
@@ -213,39 +157,32 @@ public class ToolDispatcher : IToolDispatcher
         _handlers["vm_stop"] = HandleStopAsync;
         _handlers["vm_destroy"] = HandleDestroyAsync;
         _handlers["vm_list"] = HandleListAsync;
+        _handlers["vm_find_by_name"] = HandleFindByNameAsync;
         _handlers["vm_status"] = HandleStatusAsync;
         _handlers["vm_run_command"] = HandleRunCommandAsync;
         _handlers["vm_copy_file"] = HandleCopyFileAsync;
 
-        // P1 tools with real handlers
         _handlers["vm_list_images"] = HandleListImagesAsync;
         _handlers["vm_run_script"] = HandleRunScriptAsync;
         _handlers["vm_get_file"] = HandleGetFileAsync;
         _handlers["vm_restart"] = HandleRestartAsync;
 
-        // P1 tools — Batch 2
         _handlers["vm_wait_ready"] = HandleWaitReadyAsync;
         _handlers["vm_checkpoint"] = HandleCheckpointAsync;
         _handlers["vm_cleanup_orphans"] = HandleCleanupOrphansAsync;
 
-        // P1 tools — ISO Installation
         _handlers["vm_os_install"] = HandleOsInstallAsync;
 
-        // P2 tools — Pause/Resume
         _handlers["vm_pause"] = HandlePauseAsync;
         _handlers["vm_resume"] = HandleResumeAsync;
 
-        // Configuration
         _handlers["vm_configure"] = HandleConfigureAsync;
 
-        // Issue #51: vm_create_base_image (P2 Storage).
+        // vm_create_base_image (P2 Storage).
         _handlers["vm_create_base_image"] = HandleVmCreateBaseImageAsync;
 
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // Argument Extraction Helpers
-    // ═══════════════════════════════════════════════════════════════════
 
     /// <summary>
     /// Extracts an optional string argument from the tool arguments dictionary.
@@ -259,7 +196,6 @@ public class ToolDispatcher : IToolDispatcher
 
     /// <summary>
     /// Extracts a required string argument, throwing ArgumentException if missing or empty.
-    /// See /myplans/mcp-interface/mcp-interface-design.md — Error Code Taxonomy: INVALID_PARAMETER.
     /// </summary>
     private static string GetRequiredStringArg(Dictionary<string, object?> args, string key)
     {
@@ -354,24 +290,9 @@ public class ToolDispatcher : IToolDispatcher
         return defaultValue;
     }
 
-    /// <summary>
-    /// Extracts a boolean argument strictly under MCP-D9 canonical-bool contract.
-    /// </summary>
-    /// <remarks>
-    /// Accepts ONLY:
-    /// <list type="bullet">
-    ///   <item><description>Absent key → returns <paramref name="defaultValue"/>.</description></item>
-    ///   <item><description>.NET <see cref="bool"/> value.</description></item>
-    ///   <item><description><see cref="JsonElement"/> of kind <see cref="JsonValueKind.True"/> or <see cref="JsonValueKind.False"/>.</description></item>
-    ///   <item><description><see cref="JsonElement"/> of kind <see cref="JsonValueKind.String"/> whose value is EXACTLY the ordinal lowercase string <c>"true"</c> or <c>"false"</c>.</description></item>
-    ///   <item><description>Raw <see cref="string"/> equal (ordinal) to EXACTLY <c>"true"</c> or <c>"false"</c>.</description></item>
-    /// </list>
-    /// Rejects everything else — including <c>"True"</c>, <c>"FALSE"</c>, <c>" true "</c>,
-    /// <c>"1"</c>, <c>"0"</c>, empty string, numbers, objects, and JSON null —
-    /// by throwing <see cref="ArgumentException"/> with the offending parameter name.
-    /// <see cref="ErrorMapper"/> maps that to <c>INVALID_PARAMETER</c>.
-    /// See /myplans/mcp-interface/mcp-interface-design.md — MCP-D9 / Error Code Taxonomy: INVALID_PARAMETER.
-    /// </remarks>
+    /// <summary>Absent keys use defaultValue. Accept bool/JSON booleans and raw/JSON strings exactly equal to ordinal lowercase true or false.
+    /// Reject all other values (including null, numbers, objects, empty strings, other casing and whitespace) with a named ArgumentException,
+    /// which ErrorMapper maps to INVALID_PARAMETER.</summary>
     private static bool GetStrictBoolArg(Dictionary<string, object?> args, string key, bool defaultValue)
     {
         if (!args.TryGetValue(key, out var value))
@@ -411,19 +332,12 @@ public class ToolDispatcher : IToolDispatcher
             $"Parameter '{key}' has invalid boolean value '{value}'. Expected true or false.", key);
     }
 
-    /// <summary>
-    /// Shared precondition: ensures the target VM is in "Running" state before
-    /// attempting any guest operation (command, script, file transfer).
-    /// Throws <see cref="VmNotRunningException"/> if the VM is not running.
-    /// See GitHub Issue #21.
-    /// </summary>
+    /// <summary> Shared precondition: ensures the target VM is in "Running" state before attempting any guest
+    /// operation (command, script, file transfer). Throws <see cref="VmNotRunningException"/> if the VM is not
+    /// running. See GitHub. </summary>
     private async Task EnsureVmRunningAsync(string hostId, string vmId, CancellationToken ct)
     {
-        // Issue #52 Phase 2 Gate 3 RC-1: prefer the in-process IPowerShellHost when it has
-        // been injected. The pre-flight (Issue #21 — clearer "VM not running" errors before
-        // attempting New-PSSession) is preserved; only the routing changes — we no longer
-        // funnel every vm_run_command/vm_copy_file/vm_run_script/vm_get_file through the
-        // legacy out-of-process PowerShellExecutor (PSD-D5/D6 single-facade rule).
+        // In-process preflight preserves clear VM-not-running errors without spawning legacy PowerShell on every guest call.
         string state;
         if (_psHost is not null)
         {
@@ -442,15 +356,12 @@ public class ToolDispatcher : IToolDispatcher
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════
     // P0 Tool Handlers
-    // ═══════════════════════════════════════════════════════════════════
 
     /// <summary>
     /// Handler for vm_echo: echoes back the "message" argument.
     /// This is the simplest tool — a health check that bypasses all
     /// concurrency controls and host resolution.
-    /// See /myplans/mcp-interface/mcp-interface-design.md — Complete Tool Catalog: vm_echo.
     /// </summary>
     private static Task<McpToolResponse> HandleEchoAsync(
         Dictionary<string, object?> arguments, CancellationToken ct)
@@ -464,7 +375,7 @@ public class ToolDispatcher : IToolDispatcher
 
     /// <summary>
     /// Handler for vm_diag: diagnostic tool that reports execution context and privileges.
-    /// Reports both .NET process-level info and spawned PowerShell process info.
+    /// Reports both.NET process-level info and spawned PowerShell process info.
     /// Useful for troubleshooting permission and environment issues (e.g., why vm_create fails).
     /// </summary>
     private async Task<McpToolResponse> HandleDiagAsync(
@@ -473,13 +384,11 @@ public class ToolDispatcher : IToolDispatcher
         var queueTimeout = TimeSpan.FromSeconds(_options.QueueTimeoutSeconds);
         using var globalSlot = await _concurrencyGate.AcquireGlobalSlotAsync(queueTimeout, ct);
 
-        // ── Part 0: Build / version metadata ──
         var assembly = System.Reflection.Assembly.GetExecutingAssembly();
         var fileVersionInfo = System.Diagnostics.FileVersionInfo.GetVersionInfo(assembly.Location);
         var buildTime = System.IO.File.GetLastWriteTimeUtc(assembly.Location);
         var psExePath = (_psExecutor as PowerShellExecutor)?.ExecutablePath ?? "unknown";
 
-        // ── Part 1: .NET process-level diagnostics (no PowerShell needed) ──
         using var identity = WindowsIdentity.GetCurrent();
         var principal = new WindowsPrincipal(identity);
         var isAdmin = principal.IsInRole(WindowsBuiltInRole.Administrator);
@@ -497,7 +406,6 @@ public class ToolDispatcher : IToolDispatcher
             ["psExecutable"] = psExePath,
         };
 
-        // ── Part 2: PowerShell process diagnostics ──
         Dictionary<string, object?>? psDiag = null;
         Dictionary<string, object?>? psRaw = null;
         string? psError = null;
@@ -582,35 +490,26 @@ try {
             psError = ex.Message;
         }
 
-        // ── Part 4: Targeted PowerShell tests ──
         var psTests = new List<Dictionary<string, object?>>();
 
-        // Test 1: Basic output
         psTests.Add(await RunPsTestAsync("basic-output", "Write-Output 'test-ok'", ct));
 
-        // Test 2: Hashtable to JSON
         psTests.Add(await RunPsTestAsync("hashtable-json", "@{name='test';value=42} | ConvertTo-Json", ct));
 
-        // Test 3: Admin check only
         psTests.Add(await RunPsTestAsync("admin-check",
             "$p = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent()); Write-Output \"IsAdmin: $($p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))\"", ct));
 
-        // Test 4: Get-VM (the critical test)
         psTests.Add(await RunPsTestAsync("get-vm", "try { $vms = @(Get-VM -Name '*' -ComputerName localhost -ErrorAction Stop); Write-Output \"VMs: $(@($vms).Count)\" } catch { Write-Output \"GetVM-Error: $($_.Exception.Message)\" }", ct));
 
-        // Test 4b: Get-VM WITH Import-Module (tests the fix)
         psTests.Add(await RunPsTestAsync("get-vm-with-import",
             "Import-Module Hyper-V -ErrorAction Stop; try { $vms = @(Get-VM -Name '*' -ComputerName localhost -ErrorAction Stop); Write-Output \"VMs: $(@($vms).Count)\" } catch { Write-Output \"GetVM-Error: $($_.Exception.Message)\" }", ct));
 
-        // Test 4c: Get-VM -Name with Import-Module (tests the create flow)
         psTests.Add(await RunPsTestAsync("get-vm-name-with-import",
             "Import-Module Hyper-V -ErrorAction Stop; $vm = Get-VM -Name 'nonexistent-test' -ComputerName localhost -ErrorAction SilentlyContinue; Write-Output \"Found: $($vm -ne $null)\"", ct));
 
-        // Test 4d: New-VHD availability with Import-Module (tests VHDX creation)
         psTests.Add(await RunPsTestAsync("new-vhd-check",
             "Import-Module Hyper-V -ErrorAction Stop; Write-Output \"New-VHD available: $(Get-Command New-VHD -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)\"", ct));
 
-        // Test 7: Multi-line script with file-based output capture (bypasses stdout issue)
         psTests.Add(await RunPsTestAsync("file-capture-test", @"
 $outFile = [System.IO.Path]::Combine(
     [System.IO.Path]::GetTempPath(),
@@ -637,10 +536,8 @@ try {
 }
 ", ct));
 
-        // Test 5: Hyper-V module check
         psTests.Add(await RunPsTestAsync("hyperv-module", "$m = Get-Module -ListAvailable -Name Hyper-V; Write-Output \"Module: $($m.Version)\"", ct));
 
-        // Test 6: Multi-line script with Get-VM
         psTests.Add(await RunPsTestAsync("multiline-getvm", @"
 $ErrorActionPreference = 'Stop'
 $result = @{works = $true; error = ''}
@@ -654,19 +551,14 @@ try {
 $result | ConvertTo-Json
 ", ct));
 
-        // ── Part 3: Environment variables ──
         var envDiag = new Dictionary<string, object?>
         {
             ["HYPERV_MCP_BASE_VHDX"] = Environment.GetEnvironmentVariable("HYPERV_MCP_BASE_VHDX"),
             ["HYPERV_MCP_STORAGE_ROOT"] = Environment.GetEnvironmentVariable("HYPERV_MCP_STORAGE_ROOT"),
         };
 
-        // ── Part 5: Phase 2 in-process PowerShellHost diagnostics (Issue #52) ──
-        // The legacy `powershell.*` block above probes via the OUT-of-proc executor,
-        // which is unrelated to the Phase 2 in-proc host's actual init state. Surface
-        // the in-proc host's cached init failure (if any) so live debugging can localize
-        // why `vm_diag.powershell.hyperVModule = false` while child-process probes
-        // succeed. All string fields are credential-redacted in GetInitDiagnostics().
+        // Child-process diagnostics cannot show the in-process host's initialization state.
+        // Expose its cached failure to explain divergent probe results; GetInitDiagnostics redacts all string fields.
         Dictionary<string, object?>? phase2Host = null;
         if (_psHost is not null)
         {
@@ -681,7 +573,12 @@ $result | ConvertTo-Json
                     ["lastInitErrorType"] = diag.LastInitErrorType,
                     ["lastInitErrorTrace"] = diag.LastInitErrorTrace,
                     ["psModulePath"] = diag.PsModulePath,
-                    // RC-8: per-edition attempt detail (PS7 + PS5.1) so vm_diag
+                    ["startupState"] = diag.StartupState,
+                    ["startupDetail"] = diag.StartupDetail,
+                    ["startupElapsedSeconds"] = diag.StartupElapsedSeconds,
+                    ["startupProgress"] = diag.StartupProgress,
+                    ["childIdentity"] = diag.ChildIdentity,
+                    // per-edition attempt detail (PS7 + PS5.1) so vm_diag
                     // surfaces WHICH edition failed at WHICH stage with the full
                     // inner-exception chain.
                     ["ps7Attempt"] = SerializeEditionAttempt(diag.Ps7Attempt),
@@ -700,7 +597,6 @@ $result | ConvertTo-Json
             }
         }
 
-        // ── Part 6: Issue #169 / VC-D7 — base-image hash cache warm-up status ──
         Dictionary<string, object?>? baseImageHashCacheDiag = null;
         if (_baseImageHashCache is not null)
         {
@@ -715,8 +611,8 @@ $result | ConvertTo-Json
                     warmUpDurationMs = (long)(completedAt - report.StartedAtUtc).TotalMilliseconds;
                 }
 
-                // VC-D15: project the latest mutation record (if any) as a small
-                // nested dictionary with ISO-8601 timestamp + offending hashes.
+                // project the latest mutation record (if any) as a small
+                // nested dictionary with timestamp + offending hashes.
                 Dictionary<string, object?>? lastMutationDetected = null;
                 if (sidecarStats.LastMutationDetected is { } mut)
                 {
@@ -740,23 +636,15 @@ $result | ConvertTo-Json
                     ["misses"] = stats.Misses,
                     ["computes"] = stats.Computes,
                     ["entries"] = stats.Entries,
-                    // VC-D14 / VC-D15 — sidecar persistence telemetry.
+                    // sidecar persistence telemetry.
                     ["sidecarHits"] = sidecarStats.SidecarHits,
                     ["sidecarWrites"] = sidecarStats.SidecarWrites,
                     ["sidecarDiscards"] = sidecarStats.SidecarDiscards,
                     ["lastMutationDetected"] = lastMutationDetected,
                     ["warmUpPaths"] = report is null
                         ? Array.Empty<object>()
-                        // 🟡 #1 (Issue #169 Gate 6): VC-D7 specifies "the 100 most
-                        // recently warmed paths". The previous Take(100) returned
-                        // the FIRST 100, biasing diagnostics toward boot-time
-                        // entries and hiding recent activity. WarmAsync appends
-                        // results in iteration order, so TakeLast(100) gives the
-                        // tail (the most recent). For multi-cycle warm-ups the
-                        // LatestWarmUpReport.Paths list is replaced wholesale,
-                        // so TakeLast within a single cycle reliably surfaces
-                        // the most-recent entries that diagnostic consumers care
-                        // about.
+                        // WarmAsync appends in order, so TakeLast shows the 100 most recent paths rather than boot-time entries.
+                        // Each cycle replaces the report, keeping this ordering local to that cycle.
                         : report.Paths
                             .TakeLast(100)
                             .Select(p => (object)new Dictionary<string, object?>
@@ -784,12 +672,8 @@ $result | ConvertTo-Json
 
         var result = new Dictionary<string, object?>
         {
-            // DIAG-D2 / DIAG-D3 / DIAG-D6: bumped to "v12" per VC-D14 / VC-D15
-            // (Issue #170 / post-hash sidecar persistence). The baseImageHashCache
-            // block gains sidecarHits / sidecarWrites / sidecarDiscards /
-            // lastMutationDetected fields; consumers gating on diagVersion can
-            // use this as a deterministic capability marker. "v11" referenced the
-            // VC-D7 warm-up surface; "v10" the pre-warm-up spill-file cohort.
+            // diagVersion is a capability marker: v12 adds sidecar hit/write/discard and mutation telemetry;
+            // v11 introduced warm-up status, v10 spill-file diagnostics.
             ["diagVersion"] = "v12",
             ["serverVersion"] = fileVersionInfo.FileVersion ?? "unknown",
             ["buildTimestamp"] = buildTime.ToString("yyyy-MM-ddTHH:mm:ssZ"),
@@ -806,13 +690,9 @@ $result | ConvertTo-Json
         return McpToolResponse.Ok(result);
     }
 
-    /// <summary>
-    /// RC-8 (Issue #52 Phase 2 Gate 3 Loopback #4): flatten a
-    /// <see cref="PowerShellEditionAttempt"/> snapshot into a JSON-serializable
-    /// dictionary for inclusion in <c>vm_diag.phase2Host</c>. Returns <c>null</c>
-    /// when the attempt itself is <c>null</c> (i.e. that edition was never
-    /// entered).
-    /// </summary>
+    /// <summary> (Phase 2 Gate 3 Loopback #4): flatten a <see cref="PowerShellEditionAttempt"/> snapshot into a
+    /// JSON-serializable dictionary for inclusion in <c>vm_diag.phase2Host</c>. Returns <c>null</c> when the attempt
+    /// itself is <c>null</c> (i.e. that edition was never entered). </summary>
     private static Dictionary<string, object?>? SerializeEditionAttempt(PowerShellEditionAttempt? attempt)
     {
         if (attempt is null) return null;
@@ -830,30 +710,9 @@ $result | ConvertTo-Json
         };
     }
 
-    /// <summary>
-    /// VC-D7 (Issue #169 Gate 6 remediation): serialize <see cref="WarmUpStatus"/>
-    /// as one of the 4 canonical kebab-case literals the design's §VC-D7 wire
-    /// contract specifies for <c>vm_diag.baseImageHashCache.warmUpStatus</c>:
-    /// <c>"not-started" | "in-progress" | "completed" | "cancelled"</c>.
-    /// <para>
-    /// The <see cref="WarmUpStatus"/> enum carries two additional internal-use
-    /// values (<see cref="WarmUpStatus.Partial"/>, <see cref="WarmUpStatus.Failed"/>)
-    /// that VC-D7 does NOT expose as wire literals. Mapping rationale:
-    /// </para>
-    /// <list type="bullet">
-    ///   <item><description><see cref="WarmUpStatus.Partial"/> ⇒ <c>"completed"</c>:
-    ///   the warm-up cycle DID finish; per-path successes / failures are already
-    ///   surfaced individually in <c>warmUpPaths[].status</c>. Reporting
-    ///   <c>"completed"</c> at the cycle level matches the design's "either
-    ///   completed or cancelled" terminal-state model.</description></item>
-    ///   <item><description><see cref="WarmUpStatus.Failed"/> ⇒ <c>"cancelled"</c>:
-    ///   the warm-up cycle did NOT reach completion. <c>"cancelled"</c> is the
-    ///   closest canonical literal for "did not finish"; the operator can drill
-    ///   into <c>warmUpPaths[]</c> to see the per-path <c>errorCode</c>/<c>errorMessage</c>.</description></item>
-    ///   <item><description><c>null</c> ⇒ <c>"not-started"</c>: <see cref="IBaseImageHashCache.LatestWarmUpReport"/>
-    ///   returns <see langword="null"/> until the first warm-up cycle is scheduled.</description></item>
-    /// </list>
-    /// </summary>
+    /// <summary>Wire states are not-started, in-progress, completed and cancelled. Null means not-started.
+    /// Partial maps to completed because the cycle finished; Failed maps to cancelled because it did not.
+    /// Per-path status/errorCode/errorMessage retain individual failures.</summary>
     private static string SerializeWarmUpStatus(WarmUpStatus? status) => status switch
     {
         null => "not-started",
@@ -862,19 +721,12 @@ $result | ConvertTo-Json
         WarmUpStatus.Completed => "completed",
         WarmUpStatus.Partial => "completed", // see XML doc above for mapping rationale
         WarmUpStatus.Cancelled => "cancelled",
-        WarmUpStatus.Failed => "cancelled",  // see XML doc above for mapping rationale
+        WarmUpStatus.Failed => "cancelled", // see XML doc above for mapping rationale
         _ => "not-started",
     };
 
-    /// <summary>
-    /// VC-D7: serialize <see cref="WarmUpPathStatus"/> as a stable kebab-case
-    /// string for the <c>vm_diag.baseImageHashCache.paths[].status</c> field.
-    /// The path-status set retains the richer
-    /// <c>already-warm</c>/<c>warmed-fresh</c> distinction because per-path
-    /// telemetry is operationally useful for distinguishing warm-on-init hits
-    /// from fresh computes during cold-start triage. <see cref="WarmUpPathStatus.Succeeded"/>
-    /// remains for any future call site that does not differentiate.
-    /// </summary>
+    /// <summary>Stable per-path kebab-case states retain already-warm versus warmed-fresh for cold-start triage.
+    /// Succeeded remains for callers that do not distinguish cache hits from fresh computes.</summary>
     private static string SerializeWarmUpPathStatus(WarmUpPathStatus status) => status switch
     {
         WarmUpPathStatus.Succeeded => "succeeded",
@@ -888,8 +740,6 @@ $result | ConvertTo-Json
     /// <summary>
     /// Handler for vm_create: creates a new VM from a base VHDX.
     /// Acquires global slot + per-host lock for lifecycle operations.
-    /// See /myplans/vm-management/lifecycle/lifecycle-design.md — VM creation with differencing VHDX.
-    /// See /myplans/operational/concurrency/concurrency-design.md — Operation Classification: vm_create needs Global+Host.
     /// </summary>
     private async Task<McpToolResponse> HandleCreateAsync(
         Dictionary<string, object?> args, CancellationToken ct)
@@ -901,43 +751,49 @@ $result | ConvertTo-Json
         var cpuCount = GetIntArg(args, "cpuCount", 2);
         var memoryMB = GetLongArg(args, "memoryMB", 4096);
         var autoStart = GetStrictBoolArg(args, "autoStart", false);
-        // Issue #169 / VC-D6: per-call mutation-guard knob. Strict-bool parsing
-        // (MCP-D9 / Issues #63, #71) — non-canonical values are rejected with
-        // INVALID_PARAMETER rather than silently coerced. Default true preserves
-        // ST-D6 / Issue #23 enforcement; false collapses the guard to
-        // ReadOnly-attribute-only (operator-accepted ADR-4 trade-off documented
-        // on the vm_create tool description).
+        // Strict booleans reject non-canonical input with INVALID_PARAMETER. Default hashing detects mutation;
+        // opting out accepts a ReadOnly-only guard, as the tool description warns.
         var verifyBaseImageHash = GetStrictBoolArg(args, "verifyBaseImageHash", true);
+        // Optional; when absent the pre-existing no-password contract applies unchanged. Never
+        // logged, never stored — it flows per call only.
+        var adminPassword = GetStringArg(args, "adminPassword");
+        // Present-but-unusable MUST fail fast rather than silently degrade to the no-password path
+        // or fail late after artifacts exist.
+        if (adminPassword is not null)
+        {
+            InputValidation.ValidateAdminPassword(adminPassword);
+        }
 
         var queueTimeout = TimeSpan.FromSeconds(_options.QueueTimeoutSeconds);
         using var globalSlot = await _concurrencyGate.AcquireGlobalSlotAsync(queueTimeout, ct);
         using var hostLock = await _concurrencyGate.AcquireHostLockAsync(hostId, queueTimeout, ct);
 
-        // VC-D12 (Issue #170): wrap the CreateVmAsync invocation in a linked
-        // CTS that fires after the resolved per-call timeout (default 120s,
-        // env-overridable via HYPERV_MCP_VM_CREATE_TIMEOUT_SECONDS). The
-        // synchronous pre/post SHA-256 verification (VC-D13) dominates this
-        // budget on cold OS page caches; the sidecar (VC-D14) collapses it on
-        // repeat calls. The PowerShell-internal 600s budget inside
-        // HyperVManager.CreateVmAsync is unchanged — this is a transport-only
-        // widening.
+        // The linked request timeout defaults to 120s and is environment-overridable to accommodate cold SHA-256 verification.
+        // Sidecars reduce repeat-call cost; the inner PowerShell budget stays 600s.
         var vmCreateTimeoutSeconds = ResolveVmCreateTimeoutSeconds();
         using var vmCreateCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        vmCreateCts.CancelAfter(TimeSpan.FromSeconds(vmCreateTimeoutSeconds));
+        // Password-path transport time must cover pre-boot work plus a full readiness window, not their maximum.
+        // Otherwise creation consumes readiness time and turns a preserve-VM result into cancellation rollback.
+        var transportDeadlineSeconds = string.IsNullOrEmpty(adminPassword)
+            ? vmCreateTimeoutSeconds
+            : vmCreateTimeoutSeconds
+              + Math.Max(HyperVManager.MinimumReadinessLimitSeconds, vmCreateTimeoutSeconds)
+              + PasswordPathTransportSlackSeconds;
+        vmCreateCts.CancelAfter(TimeSpan.FromSeconds(transportDeadlineSeconds));
 
-        var vmInfo = await _hyperVManager.CreateVmAsync(
-            hostId, name, baseVhdxPath, cpuCount, memoryMB, autoStart,
-            verifyBaseImageHash, vmCreateCts.Token);
+        var vmInfo = string.IsNullOrEmpty(adminPassword)
+            ? await _hyperVManager.CreateVmAsync(
+                hostId, name, baseVhdxPath, cpuCount, memoryMB, autoStart,
+                verifyBaseImageHash, vmCreateCts.Token)
+            : await _hyperVManager.CreateVmAsync(
+                hostId, name, baseVhdxPath, cpuCount, memoryMB, autoStart,
+                verifyBaseImageHash, adminPassword, vmCreateTimeoutSeconds, vmCreateCts.Token);
         return McpToolResponse.Ok(vmInfo);
     }
 
-    /// <summary>
-    /// VC-D12 (Issue #170): resolve the per-call <c>vm_create</c> transport
-    /// timeout. Reads <c>HYPERV_MCP_VM_CREATE_TIMEOUT_SECONDS</c>, validates
-    /// inclusive range 60..600, falls back to 120 on missing / invalid /
-    /// out-of-range (logs a warning for invalid). Pure helper — no side
-    /// effects beyond logging.
-    /// </summary>
+    /// <summary> resolve the per-call <c>vm_create</c> transport timeout. Reads
+    /// <c>HYPERV_MCP_VM_CREATE_TIMEOUT_SECONDS</c>, validates inclusive range 60..600, falls back to 120 on missing /
+    /// invalid / out-of-range (logs a warning for invalid). Pure helper — no side effects beyond logging. </summary>
     internal int ResolveVmCreateTimeoutSeconds()
     {
         var raw = Environment.GetEnvironmentVariable(VmCreateTimeoutEnvVar);
@@ -968,9 +824,7 @@ $result | ConvertTo-Json
 
     /// <summary>
     /// Handler for vm_start: starts a stopped VM.
-    /// Issue 3 fix: Acquires global slot + per-host lock + per-VM lock for lifecycle operations.
-    /// See /myplans/vm-management/vm-management-design.md — Capability Matrix: vm_start.
-    /// See /myplans/operational/concurrency/concurrency-design.md — Operation Classification: vm_start needs Global+Host+VM.
+    /// fix: Acquires global slot + per-host lock + per-VM lock for lifecycle operations.
     /// </summary>
     private async Task<McpToolResponse> HandleStartAsync(
         Dictionary<string, object?> args, CancellationToken ct)
@@ -991,9 +845,7 @@ $result | ConvertTo-Json
 
     /// <summary>
     /// Handler for vm_stop: stops a running VM (graceful or forced).
-    /// Issue 3 fix: Acquires global slot + per-host lock + per-VM lock for lifecycle operations.
-    /// See /myplans/vm-management/vm-management-design.md — Capability Matrix: vm_stop (graceful + force).
-    /// See /myplans/operational/concurrency/concurrency-design.md — Operation Classification: vm_stop needs Global+Host+VM.
+    /// fix: Acquires global slot + per-host lock + per-VM lock for lifecycle operations.
     /// </summary>
     private async Task<McpToolResponse> HandleStopAsync(
         Dictionary<string, object?> args, CancellationToken ct)
@@ -1001,7 +853,7 @@ $result | ConvertTo-Json
         var rawVmId = GetRequiredStringArg(args, "vmId");
         var vmId = InputValidation.ValidateVmId(rawVmId);
         var hostId = GetStringArg(args, "hostId") ?? _options.DefaultHostId;
-        // MCP-D9 (#63): strict boolean parsing — a non-canonical 'force' value
+        // (#63): strict boolean parsing — a non-canonical 'force' value
         // (e.g. "yse", 1.5, arbitrary object) is rejected with INVALID_PARAMETER
         // instead of being silently coerced to false.
         var force = GetStrictBoolArg(args, "force", false);
@@ -1018,10 +870,8 @@ $result | ConvertTo-Json
 
     /// <summary>
     /// Handler for vm_destroy: destroys a VM (stop + remove + cleanup resources).
-    /// Issue 3 fix: Acquires global slot + per-host lock + per-VM lock.
+    /// fix: Acquires global slot + per-host lock + per-VM lock.
     /// Adding VM lock ensures destroy cannot start while a command is executing on the VM.
-    /// See /myplans/vm-management/vm-management-design.md — Capability Matrix: vm_destroy.
-    /// See /myplans/operational/concurrency/concurrency-design.md — Operation Classification: vm_destroy needs Global+Host+VM.
     /// </summary>
     private async Task<McpToolResponse> HandleDestroyAsync(
         Dictionary<string, object?> args, CancellationToken ct)
@@ -1036,13 +886,8 @@ $result | ConvertTo-Json
         using var hostLock = await _concurrencyGate.AcquireHostLockAsync(hostId, queueTimeout, ct).ConfigureAwait(false);
         using var vmLock = await _concurrencyGate.AcquireVmLockAsync(hostId, vmId, vmLockTimeout, ct).ConfigureAwait(false);
 
-        // SM-D7 (issue #52): evict any persistent PSSession for this (hostId, vmId)
-        // BEFORE destroying the VM. Once the VM is gone the underlying PSSession
-        // becomes orphaned in the host runspace, leaking resources. The channel call
-        // is best-effort — failures must NOT block the destroy operation, which is
-        // the user's primary intent. Eviction is performed inside the same per-VM
-        // lock scope so no concurrent command/file-transfer can re-create the session
-        // between eviction and destroy.
+        // Evict sessions before destroy, under the same VM lock, so concurrent calls cannot recreate them or leave orphaned runspaces.
+        // Eviction is best-effort: failures must not block the requested VM destruction.
         try
         {
             await _channel.EvictSessionAsync(hostId, vmId, ct).ConfigureAwait(false);
@@ -1054,20 +899,22 @@ $result | ConvertTo-Json
         }
         catch
         {
-            // Best-effort eviction. Swallow — VM destroy is the priority.
-            // No logger is currently injected into ToolDispatcher (see ST-7);
-            // the channel itself redacts and logs internally.
+            // Eviction is best-effort; the channel redacts and logs failures internally, and VM destruction takes priority.
         }
 
         await _hyperVManager.DestroyVmAsync(hostId, vmId, ct).ConfigureAwait(false);
+
+        // A destroyed-then-recreated VM id would otherwise inherit the destroyed guest's OS
+        // classification and be routed over a transport the new guest does not speak.
+        (_channel as GuestChannelRouter)?.ForgetGuestClassification(hostId, vmId);
+        _guestRoutingHintStore?.Remove(hostId, vmId);
+
         return McpToolResponse.Ok(new { vmId, destroyed = true });
     }
 
     /// <summary>
     /// Handler for vm_list: lists VMs on a host with optional name filtering.
     /// Acquires global slot only (read-only, no per-VM/host lock needed).
-    /// See /myplans/vm-management/vm-management-design.md — Capability Matrix: vm_list.
-    /// See /myplans/operational/concurrency/concurrency-design.md — Operation Classification: vm_list needs Global only.
     /// </summary>
     private async Task<McpToolResponse> HandleListAsync(
         Dictionary<string, object?> args, CancellationToken ct)
@@ -1082,11 +929,24 @@ $result | ConvertTo-Json
         return McpToolResponse.Ok(new { vms, count = vms.Count });
     }
 
+    private async Task<McpToolResponse> HandleFindByNameAsync(
+        Dictionary<string, object?> args, CancellationToken ct)
+    {
+        var hostId = GetStringArg(args, "hostId") ?? _options.DefaultHostId;
+        var name = GetRequiredStringArg(args, "name");
+        var caseSensitive = GetStrictBoolArg(args, "caseSensitive", false);
+
+        var queueTimeout = TimeSpan.FromSeconds(_options.QueueTimeoutSeconds);
+        using var globalSlot = await _concurrencyGate.AcquireGlobalSlotAsync(queueTimeout, ct);
+
+        var vms = await _hyperVManager.FindVmsByNameAsync(hostId, name, caseSensitive, ct);
+        var matches = vms.Select(vm => new { vmId = vm.VmId, name = vm.Name, state = vm.State }).ToArray();
+        return McpToolResponse.Ok(new { matches, count = matches.Length });
+    }
+
     /// <summary>
     /// Handler for vm_status: gets detailed status for a specific VM.
     /// Acquires global slot only (read-only operation).
-    /// See /myplans/vm-management/vm-management-design.md — Capability Matrix: vm_status.
-    /// See /myplans/operational/concurrency/concurrency-design.md — Operation Classification: vm_status needs Global only.
     /// </summary>
     private async Task<McpToolResponse> HandleStatusAsync(
         Dictionary<string, object?> args, CancellationToken ct)
@@ -1102,16 +962,9 @@ $result | ConvertTo-Json
         return McpToolResponse.Ok(vmInfo);
     }
 
-    /// <summary>
-    /// Handler for vm_run_command: executes a command on a guest VM.
-    /// Acquires global slot + per-VM lock to serialize commands on the same VM's PSSession.
-    /// See /myplans/execution/commands/commands-design.md — CMD-D1.
-    /// See /myplans/operational/concurrency/concurrency-design.md — Operation Classification: vm_run_command needs Global+VM.
-    ///
-    /// Issue 4 fix: Timed-out and cancelled commands now return success: false with
-    /// appropriate error codes instead of wrapping in McpToolResponse.Ok().
-    /// See /myplans/execution/commands/commands-design.md — CMD-D4.
-    /// </summary>
+    /// <summary> Handler for vm_run_command: executes a command on a guest VM. Acquires global slot + per-VM lock to
+    /// serialize commands on the same VM's PSSession. fix: Timed-out and cancelled commands now return success: false
+    /// with appropriate error codes instead of wrapping in McpToolResponse.Ok. </summary>
     private async Task<McpToolResponse> HandleRunCommandAsync(
         Dictionary<string, object?> args, CancellationToken ct)
     {
@@ -1129,13 +982,11 @@ $result | ConvertTo-Json
         using var globalSlot = await _concurrencyGate.AcquireGlobalSlotAsync(queueTimeout, ct);
         using var vmLock = await _concurrencyGate.AcquireVmLockAsync(hostId, vmId, vmLockTimeout, ct);
 
-        // Issue #21: Check VM state before attempting session acquisition.
+        // Check VM state before attempting session acquisition.
         await EnsureVmRunningAsync(hostId, vmId, ct);
 
         var result = await _commandExecutor.ExecuteCommandAsync(hostId, vmId, command, shell, timeoutSeconds, username, password, ct);
 
-        // Issue 4: Timed-out commands return success: false with COMMAND_TIMEOUT error code.
-        // The design says timed-out commands should return success: false per CMD-D4 / ADR-9.
         if (result.TimedOut)
         {
             return new McpToolResponse
@@ -1143,7 +994,7 @@ $result | ConvertTo-Json
                 Success = false,
                 Error = $"Command timed out after {result.DurationMs}ms",
                 ErrorCode = ErrorCodes.CommandTimeout,
-                Data = result, // Include partial output per ADR-9
+                Data = result, // Include partial output
             };
         }
 
@@ -1159,10 +1010,7 @@ $result | ConvertTo-Json
             };
         }
 
-        // Review round 2 fix: Non-zero exit code must return success: false with COMMAND_FAILED.
-        // Previously, commands that exited non-zero were returned as successful MCP responses
-        // because only timeout and cancellation were handled as failures.
-        // See /myplans/mcp-interface/mcp-interface-design.md — Error Code Taxonomy: COMMAND_FAILED.
+        // Non-zero exits must fail too, not just timeouts and cancellation.
         if (result.ExitCode != 0)
         {
             return new McpToolResponse
@@ -1229,8 +1077,6 @@ $result | ConvertTo-Json
     /// <summary>
     /// Handler for vm_copy_file: copies a file or directory from host to guest VM.
     /// Acquires global slot + per-VM lock for file transfer serialization.
-    /// See /myplans/execution/file-transfer/file-transfer-design.md — FT-D1.
-    /// See /myplans/operational/concurrency/concurrency-design.md — Operation Classification: vm_copy_file needs Global+VM.
     /// </summary>
     private async Task<McpToolResponse> HandleCopyFileAsync(
         Dictionary<string, object?> args, CancellationToken ct)
@@ -1240,17 +1086,15 @@ $result | ConvertTo-Json
         var sourcePath = GetRequiredStringArg(args, "sourcePath");
         var destPath = GetRequiredStringArg(args, "destPath");
         var hostId = GetStringArg(args, "hostId") ?? _options.DefaultHostId;
-        // MCP-D9 (#63): strict boolean parsing — non-canonical 'isDirectory'
+        // (#63): strict boolean parsing — non-canonical 'isDirectory'
         // values are rejected with INVALID_PARAMETER, matching the cure already
         // applied to vm_cleanup_orphans.dryRun and vm_create.autoStart.
         var isDirectory = GetStrictBoolArg(args, "isDirectory", false);
         var username = GetStringArg(args, "username");
         var password = GetStringArg(args, "password");
 
-        // Issue #38: Validate local source path before VM resolution so callers get
-        // FILE_NOT_FOUND instead of VM_NOT_FOUND when both are invalid.
-        // Note: This check applies to the local host only. Remote file transfer
-        // is not currently supported (see myplans/execution/file-transfer/file-transfer-design.md).
+        // Validate the local source first so invalid source and VM together produce FILE_NOT_FOUND, not VM_NOT_FOUND.
+        // Remote file transfer is unsupported.
         if (!isDirectory && !System.IO.File.Exists(sourcePath))
             throw new FileNotFoundException(
                 $"Source file not found on host: {sourcePath}", sourcePath);
@@ -1263,7 +1107,7 @@ $result | ConvertTo-Json
         using var globalSlot = await _concurrencyGate.AcquireGlobalSlotAsync(queueTimeout, ct);
         using var vmLock = await _concurrencyGate.AcquireVmLockAsync(hostId, vmId, vmLockTimeout, ct);
 
-        // Issue #21: Check VM state before attempting session acquisition.
+        // Check VM state before attempting session acquisition.
         await EnsureVmRunningAsync(hostId, vmId, ct);
 
         var result = await _fileTransferService.CopyToGuestAsync(hostId, vmId, sourcePath, destPath, isDirectory, username, password, ct);
@@ -1273,8 +1117,6 @@ $result | ConvertTo-Json
     /// <summary>
     /// Handler for vm_list_images: lists available base VHDX images on a host.
     /// Acquires global slot only (read-only operation).
-    /// See /myplans/vm-management/storage/storage-design.md — Base Image Enumeration.
-    /// See /myplans/vm-management/vm-management-design.md — Capability Matrix: vm_list_images (P1).
     /// </summary>
     private async Task<McpToolResponse> HandleListImagesAsync(
         Dictionary<string, object?> args, CancellationToken ct)
@@ -1284,27 +1126,17 @@ $result | ConvertTo-Json
         var queueTimeout = TimeSpan.FromSeconds(_options.QueueTimeoutSeconds);
         using var globalSlot = await _concurrencyGate.AcquireGlobalSlotAsync(queueTimeout, ct);
 
-        // ST-D7: ListImagesAsync returns an envelope distinguishing "unconfigured"
-        // (Configured=false, soft success) from "configured but enumeration failed"
-        // (throws IoOperationFailedException → IO_ERROR) and "configured but path
-        // missing" (throws ArgumentException → INVALID_PARAMETER).
+        // Unconfigured images return soft success (Configured=false); unreadable storage throws IO_ERROR,
+        // while a missing configured path throws INVALID_PARAMETER.
         var result = await _hyperVManager.ListImagesAsync(hostId, ct);
         return McpToolResponse.Ok(result);
     }
 
-    // ═══════════════════════════════════════════════════════════════════
     // P1 Tool Handlers — Batch 1
-    // ═══════════════════════════════════════════════════════════════════
 
-    /// <summary>
-    /// Handler for vm_run_script: executes a multi-line script on a guest VM.
-    /// Acquires global slot + per-VM lock to serialize scripts on the same VM's PSSession.
-    /// See /myplans/execution/commands/commands-design.md — CMD-D1.
-    /// See /myplans/operational/concurrency/concurrency-design.md — Operation Classification: vm_run_script needs Global+VM.
-    ///
-    /// Timed-out, cancelled, and non-zero exit code scripts return success: false
-    /// with appropriate error codes, same pattern as HandleRunCommandAsync.
-    /// </summary>
+    /// <summary> Handler for vm_run_script: executes a multi-line script on a guest VM. Acquires global slot + per-VM
+    /// lock to serialize scripts on the same VM's PSSession. Timed-out, cancelled, and non-zero exit code scripts
+    /// return success: false with appropriate error codes, same pattern as HandleRunCommandAsync. </summary>
     private async Task<McpToolResponse> HandleRunScriptAsync(
         Dictionary<string, object?> args, CancellationToken ct)
     {
@@ -1322,7 +1154,7 @@ $result | ConvertTo-Json
         using var globalSlot = await _concurrencyGate.AcquireGlobalSlotAsync(queueTimeout, ct);
         using var vmLock = await _concurrencyGate.AcquireVmLockAsync(hostId, vmId, vmLockTimeout, ct);
 
-        // Issue #21: Check VM state before attempting session acquisition.
+        // Check VM state before attempting session acquisition.
         await EnsureVmRunningAsync(hostId, vmId, ct);
 
         var result = await _commandExecutor.ExecuteScriptAsync(hostId, vmId, script, shell, timeoutSeconds, username, password, ct);
@@ -1369,8 +1201,6 @@ $result | ConvertTo-Json
     /// <summary>
     /// Handler for vm_get_file: retrieves a file from guest VM to host.
     /// Acquires global slot + per-VM lock for file transfer serialization.
-    /// See /myplans/execution/file-transfer/file-transfer-design.md — FT-D2, FT-D3.
-    /// See /myplans/operational/concurrency/concurrency-design.md — Operation Classification: vm_get_file needs Global+VM.
     /// </summary>
     private async Task<McpToolResponse> HandleGetFileAsync(
         Dictionary<string, object?> args, CancellationToken ct)
@@ -1388,7 +1218,7 @@ $result | ConvertTo-Json
         using var globalSlot = await _concurrencyGate.AcquireGlobalSlotAsync(queueTimeout, ct);
         using var vmLock = await _concurrencyGate.AcquireVmLockAsync(hostId, vmId, vmLockTimeout, ct);
 
-        // Issue #21: Check VM state before attempting session acquisition.
+        // Check VM state before attempting session acquisition.
         await EnsureVmRunningAsync(hostId, vmId, ct);
 
         var result = await _fileTransferService.CopyFromGuestAsync(hostId, vmId, sourcePath, destPath, username, password, ct);
@@ -1398,8 +1228,6 @@ $result | ConvertTo-Json
     /// <summary>
     /// Handler for vm_restart: restarts a VM (stop + start as atomic operation).
     /// Acquires global slot + per-host lock + per-VM lock (lifecycle operation).
-    /// See /myplans/vm-management/vm-management-design.md — Capability Matrix: vm_restart.
-    /// See /myplans/operational/concurrency/concurrency-design.md — Operation Classification: vm_restart needs Global+Host+VM.
     /// </summary>
     private async Task<McpToolResponse> HandleRestartAsync(
         Dictionary<string, object?> args, CancellationToken ct)
@@ -1418,14 +1246,11 @@ $result | ConvertTo-Json
         return McpToolResponse.Ok(vmInfo);
     }
 
-    // ═══════════════════════════════════════════════════════════════════
     // P2 Tool Handlers — Pause/Resume
-    // ═══════════════════════════════════════════════════════════════════
 
     /// <summary>
     /// Handler for vm_pause: pauses a running VM.
     /// Acquires global slot + per-host lock + per-VM lock (lifecycle operation).
-    /// See /myplans/operational/concurrency/concurrency-design.md — Operation Classification: vm_pause needs Global+Host+VM.
     /// </summary>
     private async Task<McpToolResponse> HandlePauseAsync(
         Dictionary<string, object?> args, CancellationToken ct)
@@ -1447,7 +1272,6 @@ $result | ConvertTo-Json
     /// <summary>
     /// Handler for vm_resume: resumes a paused VM.
     /// Acquires global slot + per-host lock + per-VM lock (lifecycle operation).
-    /// See /myplans/operational/concurrency/concurrency-design.md — Operation Classification: vm_resume needs Global+Host+VM.
     /// </summary>
     private async Task<McpToolResponse> HandleResumeAsync(
         Dictionary<string, object?> args, CancellationToken ct)
@@ -1466,13 +1290,10 @@ $result | ConvertTo-Json
         return McpToolResponse.Ok(vmInfo);
     }
 
-    /// <summary>
-    /// Handler for vm_configure: modifies VM CPU and/or memory configuration.
-    /// At least one of <c>cpuCount</c> or <c>memoryMB</c> must be supplied; otherwise
-    /// an <see cref="ArgumentException"/> is thrown and mapped to INVALID_PARAMETER.
-    /// Acquires global slot + per-host lock + per-VM lock (lifecycle/configuration operation).
-    /// See /myplans/operational/concurrency/concurrency-design.md — Operation Classification.
-    /// </summary>
+    /// <summary> Handler for vm_configure: modifies VM CPU and/or memory configuration. At least one of
+    /// <c>cpuCount</c> or <c>memoryMB</c> must be supplied; otherwise an <see cref="ArgumentException"/> is thrown
+    /// and mapped to INVALID_PARAMETER. Acquires global slot + per-host lock + per-VM lock (lifecycle/configuration
+    /// operation). </summary>
     private async Task<McpToolResponse> HandleConfigureAsync(
         Dictionary<string, object?> args, CancellationToken ct)
     {
@@ -1483,10 +1304,8 @@ $result | ConvertTo-Json
         var cpuCount = GetOptionalIntArg(args, "cpuCount");
         var memoryMB = GetOptionalLongArg(args, "memoryMB");
 
-        // Issue #56 review finding 2: Range-validate before dispatching to PowerShell so
-        // callers receive stable INVALID_PARAMETER envelopes (via the ArgumentException
-        // arm + SafeArgumentMessage) instead of opaque PowerShell errors. No upper bound
-        // is enforced — host-specific limits remain PowerShell's responsibility.
+        // Validate ranges before PowerShell to return stable INVALID_PARAMETER envelopes, not opaque script errors.
+        // Host-specific upper limits remain PowerShell's responsibility.
         if (cpuCount.HasValue && cpuCount.Value < 1)
         {
             throw new ArgumentException("'cpuCount' must be a positive integer.", "cpuCount");
@@ -1513,39 +1332,36 @@ $result | ConvertTo-Json
         return McpToolResponse.Ok(vmInfo);
     }
 
-    // ═══════════════════════════════════════════════════════════════════
     // P1 Tool Handlers — Batch 2
-    // ═══════════════════════════════════════════════════════════════════
 
-    /// <summary>
-    /// Handler for vm_wait_ready: polls until a VM reaches a ready state (Running + heartbeat OK).
-    /// Acquires global slot + per-VM lock to prevent readiness polling from overlapping with
-    /// same-VM mutations (start/stop/destroy).
-    /// See /myplans/vm-management/lifecycle/lifecycle-design.md — Readiness Probes.
-    /// See /myplans/operational/concurrency/concurrency-design.md — Operation Classification: vm_wait_ready needs Global+VM.
-    /// </summary>
     private async Task<McpToolResponse> HandleWaitReadyAsync(
         Dictionary<string, object?> args, CancellationToken ct)
     {
+        var budget = new ReadinessBudget(GetIntArg(args, "timeoutSeconds", 300), _readinessClock);
         var rawVmId = GetRequiredStringArg(args, "vmId");
         var vmId = InputValidation.ValidateVmId(rawVmId);
         var hostId = GetStringArg(args, "hostId") ?? _options.DefaultHostId;
-        var timeoutSeconds = GetIntArg(args, "timeoutSeconds", 300);
+        var (username, password) = CredentialResolver.ResolveCredentials(
+            GetStringArg(args, "username"), GetStringArg(args, "password"));
 
         var queueTimeout = TimeSpan.FromSeconds(_options.QueueTimeoutSeconds);
         var vmLockTimeout = TimeSpan.FromSeconds(_options.VmLockTimeoutSeconds);
+        budget.Check("global-slot", vmId, ct);
         using var globalSlot = await _concurrencyGate.AcquireGlobalSlotAsync(queueTimeout, ct);
+        budget.Record("global-slot-acquired");
+        budget.Check("vm-lock", vmId, ct);
         using var vmLock = await _concurrencyGate.AcquireVmLockAsync(hostId, vmId, vmLockTimeout, ct);
+        budget.Record("vm-lock-acquired");
+        budget.Check("manager-entry", vmId, ct);
 
-        var vmInfo = await _hyperVManager.WaitForReadyAsync(hostId, vmId, timeoutSeconds, ct);
+        var vmInfo = await _hyperVManager.WaitForReadyAsync(hostId, vmId, budget, username, password, ct);
+        ct.ThrowIfCancellationRequested();
         return McpToolResponse.Ok(vmInfo);
     }
 
     /// <summary>
     /// Handler for vm_checkpoint: manages checkpoint operations (create, restore, list, delete).
     /// Acquires global slot + per-host lock + per-VM lock (lifecycle-grade operation).
-    /// See /myplans/vm-management/checkpoints/checkpoints-design.md — Checkpoint Workflow.
-    /// See /myplans/operational/concurrency/concurrency-design.md — Operation Classification: vm_checkpoint needs Global+Host+VM.
     /// </summary>
     private async Task<McpToolResponse> HandleCheckpointAsync(
         Dictionary<string, object?> args, CancellationToken ct)
@@ -1593,17 +1409,12 @@ $result | ConvertTo-Json
     /// <summary>
     /// Handler for vm_cleanup_orphans: finds and optionally destroys orphaned VMs.
     /// Acquires global slot + per-host lock (affects host-level resources).
-    /// See /myplans/vm-management/lifecycle/lifecycle-design.md — Orphan Cleanup.
     /// </summary>
     private async Task<McpToolResponse> HandleCleanupOrphansAsync(
         Dictionary<string, object?> args, CancellationToken ct)
     {
-        // Issue #57: Mirror the #56 cure (commit ce28d74) early-validation pattern so
-        // bad arguments produce a structured INVALID_PARAMETER envelope instead of an
-        // opaque "An error occurred invoking 'vm_cleanup_orphans'" SDK message.
-        // GetStrictBoolArg throws ArgumentException with a ParamName for non-boolean
-        // dryRun values; the dispatcher's outer try/catch + ErrorMapper.MapException
-        // converts it to ErrorCodes.InvalidParameter via the SafeArgumentMessage path.
+        // Validate early so bad arguments become INVALID_PARAMETER through ErrorMapper, not opaque SDK errors.
+        // Strict boolean failures carry the parameter name for SafeArgumentMessage.
         var hostId = GetStringArg(args, "hostId") ?? _options.DefaultHostId;
         if (string.IsNullOrWhiteSpace(hostId))
         {
@@ -1617,28 +1428,9 @@ $result | ConvertTo-Json
         using var globalSlot = await _concurrencyGate.AcquireGlobalSlotAsync(queueTimeout, ct);
         using var hostLock = await _concurrencyGate.AcquireHostLockAsync(hostId, queueTimeout, ct);
 
-        // Issue #57 (Gate 6 round 2): Let unknown manager exceptions propagate
-        // unchanged to the dispatcher's outer catch (DispatchAsync, ~line 134),
-        // which routes them through ErrorMapper.MapException. Unmapped types fall
-        // into the generic sanitization arm (ErrorMapper.cs ~line 356) which
-        // produces a populated INTERNAL_ERROR envelope with a redacted, human-
-        // readable message — preserving the redaction invariant (MCP-D6).
-        //
-        // Mirrors the #56-cure HandleConfigureAsync (commit ce28d74) pattern: no
-        // local rewrap; let the centralized ErrorMapper own the mapping.
-        //
-        // Defense-in-depth log: the raw exception (type + message + stack) is
-        // emitted at error severity at the catch site BEFORE rethrowing, so
-        // operators can see the root cause even though the client-facing
-        // envelope is sanitized. Routed through the DI-injected
-        // ILogger<ToolDispatcher> via LogError(...) (DIAG-D7 / PR #67); see
-        // the adjacent catch-site comment block below for the full rationale,
-        // including why the prior Console.Error fallback was replaced.
-        //
-        // Typed pass-through arms (OperationCanceledException, ArgumentException,
-        // HostNotFoundException, InvalidOperationException) intentionally do NOT
-        // log — each has a dedicated ErrorMapper branch and is already covered by
-        // the outer dispatch flow; mirrors the #56-cure precedent.
+        // Rethrow unchanged so centralized ErrorMapper sanitizes unknown failures into INTERNAL_ERROR.
+        // Log raw type/message/stack through the structured logger first so operators retain the cause.
+        // Known typed exceptions need no extra log; their mapper branches already handle them.
         IReadOnlyList<VmInfo> orphans;
         try
         {
@@ -1663,15 +1455,8 @@ $result | ConvertTo-Json
         }
         catch (Exception ex)
         {
-            // Issue #57 Gate 6 Finding 1: log the underlying failure with full
-            // type + message + stack at error severity at the catch site so the
-            // root cause is preserved server-side, even after sanitization
-            // strips it from the client envelope.
-            //
-            // DIAG-D7 (#65): the previous Console.Error.WriteLine fallback bypassed
-            // log severity filtering and any structured-logging sink. Now routed
-            // through the DI-wired ILogger<ToolDispatcher> as a structured
-            // LogError, preserving the redaction-then-rethrow ordering.
+            // Structured error logging preserves type/message/stack before client-envelope sanitization.
+            // Unlike Console.Error, it respects severity filters and configured sinks; keep redaction before rethrow.
             try
             {
                 _logger.LogError(
@@ -1685,21 +1470,14 @@ $result | ConvertTo-Json
                 // Logging must never mask the original failure.
             }
 
-            // Issue #57 Gate 6 Finding 2: do NOT rewrap as InvalidOperationException
-            // carrying the raw type+message — that bypasses ErrorMapper's generic
-            // sanitization arm (ErrorMapper.cs ~line 356) and leaks raw payload.
-            // Rethrow unchanged; the outer dispatch catch routes it through the
-            // sanitized generic arm → populated INTERNAL_ERROR envelope.
+            // Do not rewrap raw type/message in InvalidOperationException: that bypasses generic sanitization.
+            // Rethrow unchanged for the sanitized INTERNAL_ERROR envelope.
             throw;
         }
 
-        // LF-D10: 'unknown-age' rows are ALWAYS report-only (never destroyed),
-        // even when dryRun=false. Therefore the response-level 'action' label
-        // must reflect whether ANY row in the result is actually destroyable
-        // ('orphan' reason). A response containing only 'unknown-age' rows with
-        // dryRun=false would otherwise be mislabeled "destroyed", misreporting
-        // what happened to API consumers.
-        var anyDestroyed = !dryRun && orphans.Any(o => o.Reason == "orphan");
+        // Only orphan-candidates may be destroyed; needs-attention stays report-only.
+        // Label the action by actual destruction so a report-only non-dry-run result is not mislabeled.
+        var anyDestroyed = !dryRun && orphans.Any(o => o.Reason == "orphan-candidate");
         return McpToolResponse.Ok(new
         {
             orphans,
@@ -1709,15 +1487,11 @@ $result | ConvertTo-Json
         });
     }
 
-    // ═══════════════════════════════════════════════════════════════════
     // P1 Tool Handlers — ISO Installation
-    // ═══════════════════════════════════════════════════════════════════
 
     /// <summary>
     /// Handler for vm_os_install: installs Windows from an ISO image in a single call.
     /// Acquires global slot + per-host lock (lifecycle operation creating a new VM).
-    /// See /myplans/vm-management/iso-installation/iso-installation-design.md — ISO-D1, ISO-D2.
-    /// See /myplans/operational/concurrency/concurrency-design.md — Operation Classification: vm_os_install needs Global+Host.
     /// </summary>
     private async Task<McpToolResponse> HandleOsInstallAsync(
         Dictionary<string, object?> args, CancellationToken ct)
@@ -1737,9 +1511,12 @@ $result | ConvertTo-Json
         var windowsEdition = GetStringArg(args, "windowsEdition") ?? "Windows 11 Pro";
         var productKey = GetStringArg(args, "productKey");
         var timeoutMinutes = GetIntArg(args, "timeoutMinutes", 60);
-        // Issue #97 / ISO-D17: optional escape hatch for the C#-side resource-floor preflight.
+        // optional escape hatch for the C#-side resource-floor preflight.
         // Strict bool parsing — non-bool values are an INVALID_PARAMETER, not silently coerced.
         var skipPreflight = GetStrictBoolArg(args, "skipPreflight", false);
+        // optional initial Ubuntu login user (Windows ignores it). Its
+        // charset validation runs inside OsInstallAsync only on the Ubuntu branch.
+        var guestUsername = GetStringArg(args, "guestUsername");
 
         var queueTimeout = TimeSpan.FromSeconds(_options.QueueTimeoutSeconds);
         using var globalSlot = await _concurrencyGate.AcquireGlobalSlotAsync(queueTimeout, ct);
@@ -1749,37 +1526,16 @@ $result | ConvertTo-Json
             hostId, name, isoPath, adminPassword,
             cpuCount, memoryMB, diskSizeGB, switchName,
             locale, windowsEdition, productKey,
-            timeoutMinutes, skipPreflight, ct);
+            timeoutMinutes, skipPreflight, guestUsername, ct);
         return McpToolResponse.Ok(result);
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // P2 Tool Handlers — vm_create_base_image (Issue #51)
-    // ═══════════════════════════════════════════════════════════════════
+    // P2 Tool Handlers — vm_create_base_image
 
-    /// <summary>
-    /// Handler for <c>vm_create_base_image</c>: sysprep a Running VM, optionally
-    /// merge checkpoints, wait for shutdown, then host-side copy the primary VHDX
-    /// to the configured image directory as a generalized base image.
-    /// <para>
-    /// Orchestration steps (per IA-Gate 1b design, ISO-D18/D19/D20 + CP-D6):
-    /// </para>
-    /// <list type="number">
-    ///   <item>Resolve VM by name; preflight <c>state == Running</c> → otherwise <c>VM_NOT_RUNNING</c>.</item>
-    ///   <item>If <c>mergeCheckpoints</c>, call <see cref="ICheckpointManager.MergeAllAsync"/>;
-    ///         <c>MERGE_NOT_SUPPORTED</c> / <c>CHECKPOINT_MERGE_FAILED</c> surface via typed exceptions.</item>
-    ///   <item>Run <c>sysprep /generalize /oobe /shutdown /quiet</c> in-guest via
-    ///         <see cref="IPowerShellDirectChannel.InvokeScriptAsync"/>.</item>
-    ///   <item>Poll VM state until <c>Off</c> or <c>shutdownTimeoutSeconds</c> elapses;
-    ///         on timeout → <c>SYSPREP_FAILED</c>.</item>
-    ///   <item>Resolve primary VHDX path via <see cref="IHyperVManager.GetPrimaryVhdxPathAsync"/>.</item>
-    ///   <item>Verify <see cref="ServerOptions.ImageDirectory"/> configured; otherwise → <c>IMAGE_COPY_FAILED</c>.</item>
-    ///   <item>Host-side <see cref="System.IO.File.Copy(string, string, bool)"/> with <c>overwrite=false</c>;
-    ///         IO failure → <c>IMAGE_COPY_FAILED</c>.</item>
-    ///   <item>Return <see cref="ImageInfo"/> with <c>Generalized=true</c>.</item>
-    /// </list>
-    /// Concurrency: global + host + VM (lifecycle-grade).
-    /// </summary>
+    /// <summary>Under global/host/VM locks, require Running (otherwise VM_NOT_RUNNING), optionally merge checkpoints
+    /// (MERGE_NOT_SUPPORTED/CHECKPOINT_MERGE_FAILED), then run sysprep /generalize /oobe /shutdown /quiet through the guest channel.
+    /// Wait for Off within shutdownTimeoutSeconds (otherwise SYSPREP_FAILED); resolve the primary VHDX and copy host-side without overwrite.
+    /// Missing ImageDirectory or copy failure yields IMAGE_COPY_FAILED; return ImageInfo with Generalized=true.</summary>
     private async Task<McpToolResponse> HandleVmCreateBaseImageAsync(
         Dictionary<string, object?> args, CancellationToken ct)
     {
@@ -1813,7 +1569,6 @@ $result | ConvertTo-Json
         using var globalSlot = await _concurrencyGate.AcquireGlobalSlotAsync(queueTimeout, ct).ConfigureAwait(false);
         using var hostLock = await _concurrencyGate.AcquireHostLockAsync(hostId, queueTimeout, ct).ConfigureAwait(false);
 
-        // ── Step 1: Resolve VM by name; preflight state == Running ──────────
         var allVms = await _hyperVManager.ListVmsAsync(hostId, vmName, ct).ConfigureAwait(false);
         var vm = allVms.FirstOrDefault(v => string.Equals(v.Name, vmName, StringComparison.OrdinalIgnoreCase));
         if (vm is null)
@@ -1828,7 +1583,6 @@ $result | ConvertTo-Json
             throw new VmNotRunningException(hostId, vm.VmId, vm.State);
         }
 
-        // ── Step 2 (optional): Merge checkpoints ────────────────────────────
         MergeResult? mergeOutcome = null;
         if (mergeCheckpoints)
         {
@@ -1837,13 +1591,9 @@ $result | ConvertTo-Json
             mergeOutcome = await _checkpointManager.MergeAllAsync(hostId, vm.VmId, ct).ConfigureAwait(false);
         }
 
-        // ── Resolve credentials for in-guest sysprep ────────────────────────
         var (resolvedUser, resolvedPass) = CredentialResolver.ResolveCredentials(username, password);
 
-        // ── Step 3: In-guest sysprep via IPowerShellDirectChannel ───────────
-        // Single self-contained script — runs sysprep.exe synchronously, surfaces
-        // any non-zero exit code as a remote throw which the channel surfaces as
-        // an exception (mapped to SYSPREP_FAILED below).
+        // The guest script surfaces non-zero sysprep exits as throws mapped to SYSPREP_FAILED.
         const string sysprepScript = @"
 $ErrorActionPreference = 'Stop'
 $sysprepPath = Join-Path $env:windir 'System32\Sysprep\sysprep.exe'
@@ -1884,11 +1634,8 @@ if ($p.ExitCode -ne 0) {
                 $"In-guest sysprep invocation failed for VM '{vmName}': {ex.Message}", ex);
         }
 
-        // IA-Gate 6 R1 Finding 1: PowerShellHost.InvokeWithTimeoutAsync surfaces
-        // terminating in-guest script errors as Success=false / ExitCode=1 rather
-        // than as thrown exceptions. Must inspect the result and fail fast instead
-        // of proceeding to the poll-for-Off loop, which would otherwise silently
-        // misattribute the failure to a shutdown-timeout.
+        // Terminating guest errors can return Success=false/ExitCode=1 instead of throwing.
+        // Check now or the Off-state poll would misreport a sysprep failure as shutdown timeout.
         if (!sysprepResult.Success)
         {
             var reason = string.IsNullOrWhiteSpace(sysprepResult.Stderr)
@@ -1898,10 +1645,8 @@ if ($p.ExitCode -ne 0) {
                 $"In-guest sysprep reported failure for VM '{vmName}': {reason}");
         }
 
-        // ── Step 4: Poll VM state until Off or timeout ──────────────────────
-        // Check state immediately before the first delay so very short timeouts
-        // are honored, and cap each delay to the remaining budget so the total
-        // wait stays within shutdownTimeoutSeconds (±a single status RPC).
+        // Check before delaying and cap delays to the remaining budget so short timeouts are honored,
+        // within one status RPC of shutdownTimeoutSeconds.
         var pollDeadline = DateTime.UtcNow.AddSeconds(shutdownTimeoutSeconds);
         var pollInterval = TimeSpan.FromSeconds(5);
         string lastObservedState = vm.State;
@@ -1939,7 +1684,6 @@ if ($p.ExitCode -ne 0) {
                 $"VM '{vmName}' did not reach 'Off' state within {shutdownTimeoutSeconds} seconds after sysprep was invoked (last state: {lastObservedState}).");
         }
 
-        // ── Step 5: Resolve primary VHDX path ───────────────────────────────
         string sourceVhdx;
         try
         {
@@ -1952,7 +1696,6 @@ if ($p.ExitCode -ne 0) {
                 $"Failed to resolve primary VHDX path for VM '{vmName}': {ex.Message}", ex);
         }
 
-        // ── Step 6: Verify ImageDirectory configured ────────────────────────
         var imageDir = _options.ImageDirectory;
         if (string.IsNullOrWhiteSpace(imageDir))
         {
@@ -1970,7 +1713,7 @@ if ($p.ExitCode -ne 0) {
 
         var destPath = System.IO.Path.Combine(imageDir, imageName + ".vhdx");
 
-        // ── Step 7: Host-side File.Copy (NOT IFileTransferService — ISO-D18) ─
+        // Copy host-side, not through IFileTransferService.
         try
         {
             // overwrite: false — refuse to clobber an existing base image.
@@ -1990,11 +1733,8 @@ if ($p.ExitCode -ne 0) {
                 ex, sourcePath: sourceVhdx, destinationPath: destPath);
         }
 
-        // ── Step 8: Return ImageInfo with Generalized=true ──────────────────
-        // IA-Gate 6 R1 Finding 2: ImageInfo carries the Generalized marker directly
-        // (matching the documented public contract). Provenance extras
-        // (sourceVm*, mergedCheckpointCount, checkpointsMerged) live on an envelope
-        // around the ImageInfo rather than as sibling fields of an anonymous object.
+        // Keep Generalized on ImageInfo for the public contract; provenance (sourceVm*, mergedCheckpointCount,
+        // checkpointsMerged) belongs on its envelope, not as anonymous-object siblings.
         var info = new ImageInfo
         {
             Name = imageName,

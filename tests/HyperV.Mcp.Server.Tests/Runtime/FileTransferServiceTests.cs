@@ -101,6 +101,9 @@ public class FileTransferServiceTests : IDisposable
             .Callback(() => calls.Add("copy"))
             .ReturnsAsync(Success());
 
+        // The verify step must report the SOURCE's size: the service reconciles the two, so a
+        // stub returning an arbitrary size would be asserting the truncation false-success shape.
+        var sourceSize = new FileInfo(_tempSourceFile).Length;
         var invokeCount = 0;
         _mockChannel
             .Setup(c => c.InvokeScriptAsync(
@@ -114,7 +117,7 @@ public class FileTransferServiceTests : IDisposable
                 invokeCount++;
                 calls.Add(invokeCount == 1 ? "ensure-parent" : "verify");
             })
-            .ReturnsAsync(() => invokeCount == 1 ? Success() : Success((long)2048));
+            .ReturnsAsync(() => invokeCount == 1 ? Success() : Success(sourceSize));
 
         var result = await _service.CopyToGuestAsync(
             TestHostId, TestVmId,
@@ -125,7 +128,7 @@ public class FileTransferServiceTests : IDisposable
         calls.Should().Equal("ensure-parent", "copy", "verify");
         result.Verified.Should().BeTrue();
         result.IsDirectory.Should().BeFalse();
-        result.BytesTransferred.Should().Be(2048);
+        result.BytesTransferred.Should().Be(sourceSize);
         result.FileCount.Should().Be(1);
         result.SourcePath.Should().Be(_tempSourceFile);
         result.DestPath.Should().Be(@"C:\dest\file.txt");

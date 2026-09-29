@@ -241,6 +241,16 @@ public class FileTransferService : IFileTransferService
                 $"File transfer verification failed for {guestDestinationPath}: {ex.Message}", ex);
         }
 
+        // Reading the guest-observed size is not verification on its own: without this comparison
+        // a short write is reported as a complete, verified transfer.
+        var sourceSize = new FileInfo(localSourcePath).Length;
+        if (destSize != sourceSize)
+        {
+            throw new GuestTransferFailedException(
+                $"Transfer to guest '{vmId}' failed for path '{guestDestinationPath}': the source " +
+                $"holds {sourceSize} bytes but the guest holds {destSize} bytes after the copy.");
+        }
+
         return new FileTransferResult
         {
             SourcePath = localSourcePath,
@@ -381,18 +391,22 @@ public class FileTransferService : IFileTransferService
                 $"Failed to copy file from guest {vmId}: {copy.Stderr.Trim()}");
         }
 
+        // These two are the pull-side mirror of the push-side reconciliation. A bare
+        // InvalidOperationException would map to COMMAND_FAILED and omit the VM and direction,
+        // reporting a short read as a command problem rather than an incomplete transfer.
         if (!File.Exists(localDestinationPath))
         {
-            throw new InvalidOperationException(
-                $"File transfer verification failed for {localDestinationPath}: destination does not exist.");
+            throw new GuestTransferFailedException(
+                $"Transfer from guest '{vmId}' failed for path '{guestSourcePath}': nothing was " +
+                $"written to '{localDestinationPath}'.");
         }
 
         var actualSize = new FileInfo(localDestinationPath).Length;
         if (actualSize != expectedSize)
         {
-            throw new InvalidOperationException(
-                $"File transfer verification failed for {localDestinationPath}: " +
-                $"expected {expectedSize} bytes, got {actualSize} bytes.");
+            throw new GuestTransferFailedException(
+                $"Transfer from guest '{vmId}' failed for path '{guestSourcePath}': the guest " +
+                $"holds {expectedSize} bytes but {actualSize} bytes were received.");
         }
 
         return new FileTransferResult
@@ -478,10 +492,37 @@ public class FileTransferService : IFileTransferService
 
         ZipFile.ExtractToDirectory(localZip, localDestinationPath, overwriteFiles: true);
 
+        // Only the entries this transfer delivered are counted, and each is reconciled against the
+        // size the guest recorded for it in the archive. Summing the whole destination would count
+        // unrelated pre-existing files, and skipping the comparison would report a short extraction
+        // as a complete transfer. See
+        // myplans/remoting/linux-guest-support/linux-guest-file-transfer-spec.md — FR-VER-1..FR-VER-5.
         long totalBytes = 0;
-        foreach (var f in Directory.EnumerateFiles(localDestinationPath, "*", SearchOption.AllDirectories))
+        using (var archive = ZipFile.OpenRead(localZip))
         {
-            totalBytes += new FileInfo(f).Length;
+            foreach (var entry in archive.Entries)
+            {
+                // A directory entry has an empty name and no content.
+                if (entry.Name.Length == 0) continue;
+
+                var extractedPath = Path.Combine(
+                    localDestinationPath, entry.FullName.Replace('/', Path.DirectorySeparatorChar));
+                if (!File.Exists(extractedPath))
+                {
+                    throw new GuestTransferFailedException(
+                        $"Transfer from guest '{vmId}' failed for path '{guestSourcePath}': entry " +
+                        $"'{entry.FullName}' was not written to '{localDestinationPath}'.");
+                }
+                var extractedSize = new FileInfo(extractedPath).Length;
+                if (extractedSize != entry.Length)
+                {
+                    throw new GuestTransferFailedException(
+                        $"Transfer from guest '{vmId}' failed for path '{guestSourcePath}': entry " +
+                        $"'{entry.FullName}' holds {extractedSize} bytes on the host but the guest " +
+                        $"reported {entry.Length} bytes.");
+                }
+                totalBytes += extractedSize;
+            }
         }
 
         return new FileTransferResult
@@ -616,29 +657,33 @@ if ([string]::IsNullOrEmpty($parent)) { return }
 [void][System.IO.Directory]::CreateDirectory($parent)
 ";
 
-    private const string VerifyFileScript = @"
+    // Internal so the Linux channel can recognize each intent by the constant's identity rather
+    // than by matching script text; re-bodying one then breaks a compile-time mapping instead of
+    // silently degrading to a command that does nothing.
+    // See myplans/remoting/linux-guest-support/linux-guest-file-transfer-design.md.
+    internal const string VerifyFileScript = @"
 param($path)
 (Get-Item -LiteralPath $path -ErrorAction Stop).Length
 ";
 
-    private const string ProbeGuestPathScript = @"
+    internal const string ProbeGuestPathScript = @"
 param($path)
 $i = Get-Item -LiteralPath $path -ErrorAction Stop
 if ($i.PSIsContainer) { 'dir' } else { $i.Length }
 ";
 
-    private const string BuildGuestTempPathScript = @"
+    internal const string BuildGuestTempPathScript = @"
 param($name)
 [System.IO.Path]::Combine($env:TEMP, $name)
 ";
 
-    private const string CompressOnGuestScript = @"
+    internal const string CompressOnGuestScript = @"
 param($src, $zip)
 Compress-Archive -Path (Join-Path $src '*') -DestinationPath $zip -CompressionLevel Fastest -Force
 (Get-Item -LiteralPath $zip).Length
 ";
 
-    private const string ExpandAndCleanupOnGuestScript = @"
+    internal const string ExpandAndCleanupOnGuestScript = @"
 param($zip, $dest)
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
 Expand-Archive -Path $zip -DestinationPath $dest -Force
@@ -646,7 +691,7 @@ try { Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue } catch
 (Get-ChildItem -LiteralPath $dest -Recurse -File | Measure-Object -Property Length -Sum).Sum
 ";
 
-    private const string BestEffortRemoveGuestPathScript = @"
+    internal const string BestEffortRemoveGuestPathScript = @"
 param($p)
 Remove-Item -LiteralPath $p -Force -Recurse -ErrorAction SilentlyContinue
 $true

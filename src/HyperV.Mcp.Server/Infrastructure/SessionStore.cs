@@ -388,6 +388,13 @@ try {
     $rc103aDiscovery += ""RC103a:Discovery probe failed: $($_.Exception.Message)""
 }
 
+# Defense in depth (the load-bearing suppression is at PowerShellHost, SOE-D10):
+# $error is the runspace-global automatic variable of the long-lived singleton
+# runspace, so without this it accumulates OTHER VMs' frames for the process
+# lifetime and renders them into this VM's failure text.
+# See /myplans/remoting/session-management/session-open-error-envelope-design.md — SOE-D1.
+$error.Clear()
+
 try {
     # RC-11.1: explicit [Guid] coercion retained. PS5.1's Hyper-V cmdlets
     # demand a real [Guid] for the -Id family of parameters; passing a
@@ -470,27 +477,19 @@ catch {
     if ($null -ne $_.TargetObject) {
         $errLines += ""RC103a:TargetObject=$([string]$_.TargetObject)""
     }
-    $errLines += ""RC103a:ScriptStackTrace=$($_.ScriptStackTrace)""
-
-    # Full inner-exception chain via Exception.ToString().
-    $errLines += ""RC103a:Exception.ToString()=$($_.Exception.ToString())""
 
     if ($_.Exception.InnerException) {
         $errLines += ""RC103a:InnerExceptionType=$($_.Exception.InnerException.GetType().FullName)""
         $errLines += ""RC103a:InnerException.Message=$($_.Exception.InnerException.Message)""
     }
 
-    # Stacked errors — $error[0..2] enumerated via Out-String. Multiple
-    # errors may have piled up before the catch fired; enumerate the most
-    # recent few so we can see the stack of contributing failures.
+    # MUST NOT render ScriptStackTrace, Exception.ToString(), or an
+    # ($error[...] | Out-String) slice here: Out-String on an ErrorRecord renders
+    # InvocationInfo.Line / PositionMessage, i.e. this script's own body, into the
+    # text that reaches the caller. Every facet above is extracted by name instead.
+    # See /myplans/remoting/session-management/session-open-error-envelope-design.md — SOE-D2.
     if ($error.Count -gt 0) {
         $errLines += ""RC103a:errorCount=$($error.Count)""
-        $errSlice = @()
-        for ($i = 0; $i -lt [Math]::Min(3, $error.Count); $i++) {
-            $errSlice += ""--- error[$i] ---""
-            $errSlice += ($error[$i] | Out-String).TrimEnd()
-        }
-        $errLines += ""RC103a:errorSlice=`n"" + ($errSlice -join ""`n"")
     }
 
     Write-Error -Message ($errLines -join ""`n"") -ErrorAction Continue
@@ -541,14 +540,15 @@ catch {
         // (the spill file) MUST be redaction-passed first. Compute the redacted
         // payload exactly once and derive both the spill content and the preview
         // substring (and reported length) from that redacted payload.
-        var redactedStderr = CredentialResolver.RedactPassword(result.Stderr, password);
+        var redactedStderr = CredentialResolver.RedactPasswordRepresentations(result.Stderr, password);
         var redactedPreview = redactedStderr.Substring(0, System.Math.Min(500, redactedStderr.Length));
+        string? stderrSpillSummary = null;
         if (!result.Success && redactedStderr.Length > 0)
         {
-            var spillSummary = StderrSpillHelper.Spill(redactedStderr);
+            stderrSpillSummary = StderrSpillHelper.Spill(redactedStderr);
             _logger.LogDebug(
                 "SessionStore InvokeAsync returned: success={Success} stderrLen={Len} outputCount={N} spillSummary={Summary} preview={Preview}",
-                result.Success, redactedStderr.Length, result.Output.Count, spillSummary, redactedPreview);
+                result.Success, redactedStderr.Length, result.Output.Count, stderrSpillSummary, redactedPreview);
         }
         else
         {
@@ -563,26 +563,102 @@ catch {
                 "SessionStore: failed to create PSSession {SessionName} (stderrLength={StderrLength}): {Error}",
                 sessionName, redactedStderr.Length, redactedStderr);
 
-            // Issue #209 (sub-finding) / VC-SO-D2: throw the typed
-            // SessionOpenFailedException so ErrorMapper classifies this as
-            // SESSION_FAILED (not FILE_NOT_FOUND via the path-not-found
-            // substring arm that previously caught Linux PSDirect failures
-            // whose stderr contained "cannot find path"). Derives from
-            // InvalidOperationException to preserve backward compat with
-            // SessionStoreTests.GetOrCreateAsync_NewPSSessionThrows_* /
-            // _EmptyExceptionMessage_* which assert InvalidOperationException
-            // (C5 backward-compat lock). The composed message preserves the
-            // existing payload semantics (redactedStderr) so those tests
-            // continue to find their marker substrings.
+            var credentialRejected = IsCredentialRejectionSignal(redactedStderr);
+
+            // The wire payload omits ScriptStackTrace and the positional renderings the host
+            // layer re-adds after the script returns; the log/spill path above keeps the full
+            // chain. See
+            // /myplans/remoting/session-management/session-open-error-envelope-design.md — SOE-D10.
+            var redactedWireStderr = CredentialResolver.RedactPasswordRepresentations(
+                result.WireOrFullStderr, password);
+
+            // A safe renderer that produced no text yields a fixed safe cause. Reaching for the full
+            // stderr would re-admit the unsafe representation WireStderr exists to replace.
+            if (string.IsNullOrWhiteSpace(redactedWireStderr))
+            {
+                redactedWireStderr =
+                    "the guest session could not be opened and the guest returned no safe diagnostic text";
+            }
+
+            // Issue #209 (sub-finding) / VC-SO-D2: the typed exception keeps this on the
+            // SESSION_FAILED arm rather than the path-not-found substring arm below it,
+            // which used to swallow Linux PSDirect failures whose stderr said "cannot find
+            // path". Derives from InvalidOperationException for the C5 backward-compat lock.
+            //
+            // Composed from redacted text, NEVER result.Stderr: only the password-aware pass
+            // above can scrub a raw or encoded password; the mapper's downstream pass cannot.
+            // See myplans/remoting/session-management/guest-credential-rejection-design.md — GCR-D4.
             throw new SessionOpenFailedException(
                 sessionName,
                 vmId,
-                $"Failed to create PSSession '{sessionName}': {redactedStderr}");
+                $"Failed to create PSSession '{sessionName}': {redactedWireStderr}",
+                innerException: null,
+                credentialRejected: credentialRejected,
+                username: username,
+                spillSummary: stderrSpillSummary,
+                // Captured structurally at the throw site so bounding never has to re-infer the
+                // cause from flattened prose, and reproduces it verbatim wherever it occurred.
+                decisiveCause: ErrorMapper.SanitizeSessionOpenErrorText(redactedWireStderr));
         }
 
         _logger.LogInformation(
             "SessionStore: created session {SessionName} (vmId={VmId}, user={User})",
             sessionName, vmId, username);
+    }
+
+    /// <summary>
+    /// Recognizes a guest credential rejection in the already-redacted failed-open text.
+    /// Fail-closed: an unrecognized signal returns false so the generic SESSION_FAILED arm
+    /// handles it rather than the server guessing an auth verdict.
+    /// See myplans/remoting/session-management/guest-credential-rejection-design.md — GCR-D2.
+    /// </summary>
+    internal static bool IsCredentialRejectionSignal(string? redactedStderr)
+    {
+        if (string.IsNullOrWhiteSpace(redactedStderr))
+            return false;
+
+        string[] signals =
+        {
+            "credential is invalid",
+            "invalid credential",
+            "bad username or password",
+            "logon failure",
+            "user name or password is incorrect",
+            "access is denied due to invalid credentials",
+            "0x8009030c",
+        };
+
+        foreach (var signal in signals)
+        {
+            if (TokenMatcher.ContainsPhrase(redactedStderr, signal))
+                return true;
+        }
+
+        // "authenticationexception" also covers transport-auth failures (TLS/certificate,
+        // Kerberos/SPN), so it only counts when no such context is present -- otherwise a
+        // certificate problem would be reported as a wrong password.
+        return TokenMatcher.ContainsPhrase(redactedStderr, "authenticationexception")
+            && !ContainsNonCredentialAuthContext(redactedStderr);
+    }
+
+    private static bool ContainsNonCredentialAuthContext(string redactedStderr)
+    {
+        string[] nonCredentialContexts =
+        {
+            "certificate",
+            "ssl",
+            "tls",
+            "kerberos",
+            "spn",
+            "trust relationship",
+        };
+
+        foreach (var context in nonCredentialContexts)
+        {
+            if (TokenMatcher.ContainsPhrase(redactedStderr, context))
+                return true;
+        }
+        return false;
     }
 
     /// <summary>

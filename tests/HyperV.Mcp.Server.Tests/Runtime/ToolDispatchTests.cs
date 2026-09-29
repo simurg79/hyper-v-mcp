@@ -88,19 +88,13 @@ public class ToolDispatchTests
             "tools not in the catalog must not be registered");
     }
 
-    /// <summary>
-    /// The dispatcher must report all 22 catalog tools as registered.
-    /// See /myplans/mcp-interface/mcp-interface-design.md — Complete Tool Catalog
-    /// (22 tools, including vm_diag, vm_os_install, and vm_create_base_image per Issue #51).
-    /// </summary>
     [Fact]
-    public void Dispatcher_Reports_All_22_Catalog_Tools()
+    public void Dispatcher_Reports_All_23_Catalog_Tools()
     {
         var registered = _dispatcher.GetRegisteredTools();
 
-        registered.Should().HaveCount(22,
-            "all 22 catalog tools must be registered in the dispatcher " +
-            "(see /myplans/mcp-interface/mcp-interface-design.md — Complete Tool Catalog, plus vm_diag, vm_os_install, and vm_create_base_image (Issue #51))");
+        registered.Should().HaveCount(23,
+            "every catalog tool, including exact-name lookup, must have a handler");
 
         foreach (var tool in ToolCatalog.AllTools)
         {

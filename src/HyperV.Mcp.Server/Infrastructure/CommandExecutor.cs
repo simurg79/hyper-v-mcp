@@ -70,7 +70,12 @@ public class CommandExecutor : ICommandExecutor
 
         // Issue 2: Validate vmId is a GUID and shell is allowed.
         var safeVmId = InputValidation.ValidateVmId(vmId);
-        var safeShell = InputValidation.ValidateShell(shell);
+        // LGS-SSH-D3: on the Linux SSH path the shell must validate against the Linux set
+        // (bash/sh/default), not the Windows set, and the SSH channel runs the actual
+        // command (args["cmd"]) under the guest shell rather than the PowerShell wrapper.
+        var safeShell = profile.IsLinuxGuest
+            ? ResolveLinuxShell(shell)
+            : InputValidation.ValidateShell(shell);
 
         _logger.LogDebug(
             "Executing command on {HostId}:{VmId} via shell={Shell}, timeout={Timeout}s",
@@ -109,7 +114,10 @@ public class CommandExecutor : ICommandExecutor
 
         // Issue 2: Validate vmId is a GUID and shell is allowed.
         var safeVmId = InputValidation.ValidateVmId(vmId);
-        var safeShell = InputValidation.ValidateShell(shell);
+        // LGS-SSH-D3: Linux SSH path validates against the Linux shell set (see ExecuteCommandAsync).
+        var safeShell = profile.IsLinuxGuest
+            ? ResolveLinuxShell(shell)
+            : InputValidation.ValidateShell(shell);
 
         // Fix 2: Encode script as base64 to prevent here-string terminator injection.
         var base64Script = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(script));
@@ -310,6 +318,24 @@ public class CommandExecutor : ICommandExecutor
     internal static string EscapePowerShellString(string input)
     {
         return input.Replace("'", "''");
+    }
+
+    /// <summary>
+    /// LGS-SSH-D3: map the caller-supplied shell to a Linux-valid shell for the SSH path.
+    /// The tool defaults (<c>cmd</c> for vm_run_command, <c>powershell</c> for vm_run_script)
+    /// are Windows-oriented and carry no meaning on Linux, so they collapse to the guest
+    /// login shell (<c>default</c>). Any other value is validated against the Linux allow-list
+    /// (bash/sh/default), so a Linux-routed call cannot smuggle an arbitrary shell token.
+    /// </summary>
+    private static string ResolveLinuxShell(string shell)
+    {
+        if (string.Equals(shell, "cmd", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(shell, "powershell", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(shell, "pwsh", StringComparison.OrdinalIgnoreCase))
+        {
+            return "default";
+        }
+        return InputValidation.ValidateLinuxShell(shell);
     }
 
     /// <summary>

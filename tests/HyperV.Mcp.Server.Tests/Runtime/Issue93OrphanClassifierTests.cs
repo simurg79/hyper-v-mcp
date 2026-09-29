@@ -115,17 +115,20 @@ public class Issue93OrphanClassifierTests
             "the age-only predicate (LF-D10) must not branch on VM power state.");
     }
 
-    // ─── (b) Running, tagged, age > 24h → reason=orphan ─────────────────
+    // ─── (b) Running, tagged, aged, NO role=ephemeral → needs-attention ─────
 
     /// <summary>
-    /// Scenario (b): a running, tagged VM whose creation timestamp is older than
-    /// the 24h cutoff lands in the 'orphan' bucket. With <c>dryRun:false</c> the
-    /// script destroys it; the row is still returned with <c>reason="orphan"</c>.
-    /// We assert the C# mapping faithfully reflects the predicate's classification
-    /// and the <c>$dryRun</c> flag is wired into the script as <c>$false</c>.
+    /// Scenario (b), ratified #207 contract: a running, tagged VM that is aged
+    /// past the 24h cutoff but carries only the legacy <c>created=</c> marker and
+    /// NO valid <c>role=ephemeral</c> now classifies as <c>needs-attention</c> —
+    /// reported but NEVER auto-destroyed (the TC-W14/TC-L13 donor case). This
+    /// replaces the retired pre-#207 behavior that mapped an aged Running+tagged
+    /// VM to <c>orphan</c> and deleted it. The #93 power-state-neutrality intent
+    /// is preserved: the destroy gate must not branch on VM state, and the
+    /// destroy branch is restricted to <c>orphan-candidate</c>.
     /// </summary>
     [Fact]
-    public async Task CleanupOrphansAsync_RunningTaggedOldVm_MapsToReasonOrphan()
+    public async Task CleanupOrphansAsync_RunningTaggedOldVm_NoEphemeralRole_MapsToNeedsAttention()
     {
         var (manager, exec) = BuildManager();
         var json = """
@@ -137,7 +140,7 @@ public class Issue93OrphanClassifierTests
             "ProcessorCount": 4,
             "MemoryMB": 4096,
             "UptimeSeconds": 100000,
-            "Reason": "orphan"
+            "Reason": "needs-attention"
           }
         ]
         """;
@@ -154,33 +157,33 @@ public class Issue93OrphanClassifierTests
 
         result.Should().HaveCount(1);
         result[0].Name.Should().Be("old-running-vm");
-        result[0].Reason.Should().Be("orphan",
-            "running + tagged + >24h-old must classify as 'orphan' (LF-D10).");
+        result[0].Reason.Should().Be("needs-attention",
+            "aged + tagged but NO role=ephemeral must be report-only needs-attention (CO-D3, TC-W14).");
 
-        // Predicate-authoring invariant: dryRun=false must emit `$dryRun = $false`
-        // and the orphan branch must call Stop-VM/Remove-VM.
+        // Predicate-authoring invariant: dryRun=false wires $false, and the
+        // destroy gate is restricted to orphan-candidate (never needs-attention).
         capturedScript.Should().Contain("$dryRun = $false",
             "dryRun:false must flow into the script as the PS literal $false.");
-        capturedScript.Should().Contain("Stop-VM",
-            "the orphan-destroy branch must invoke Stop-VM under -not $dryRun.");
-        capturedScript.Should().Contain("Remove-VM",
-            "the orphan-destroy branch must invoke Remove-VM under -not $dryRun.");
+        capturedScript.Should().Contain("$reason -eq 'orphan-candidate' -and -not $dryRun",
+            "the destroy gate must be restricted to orphan-candidate (CO-D6).");
+        capturedScript.Should().NotContain("$reason -eq 'needs-attention' -and -not $dryRun",
+            "there must be NO destroy branch keyed on needs-attention.");
     }
 
-    // ─── (c) Tagged VM with garbled timestamp → unknown-age, never destroyed
+    // ─── (c) Tagged VM with garbled timestamp → needs-attention, never destroyed
 
     /// <summary>
     /// Scenario (c): a tagged VM whose <c>Notes</c> creation timestamp cannot be
-    /// parsed lands in the 'unknown-age' bucket. It is ALWAYS reported but NEVER
+    /// parsed lands in the 'needs-attention' bucket. It is ALWAYS reported but NEVER
     /// auto-destroyed — even when <c>dryRun:false</c>. Run twice (dryRun:true and
     /// dryRun:false) and assert that:
-    ///   - the row surfaces with <c>reason="unknown-age"</c> in both runs, and
-    ///   - the script's destroy gate (<c>if ($reason -eq 'orphan' -and -not $dryRun)</c>)
-    ///     specifically restricts destroy to the 'orphan' reason — i.e. the
-    ///     unknown-age branch can never enter the Stop-VM/Remove-VM block.
+    ///   - the row surfaces with <c>reason="needs-attention"</c> in both runs, and
+    ///   - the script's destroy gate (<c>if ($reason -eq 'orphan-candidate' -and -not $dryRun)</c>)
+    ///     specifically restricts destroy to the 'orphan-candidate' reason — i.e. the
+    ///     needs-attention branch can never enter the Stop-VM/Remove-VM block.
     /// We cannot invoke Stop-VM/Remove-VM on the .NET side; instead we assert the
     /// predicate-authoring invariant in the script that makes destroy structurally
-    /// impossible for unknown-age rows.
+    /// impossible for needs-attention rows.
     /// </summary>
     [Theory]
     [InlineData(true)]
@@ -197,7 +200,7 @@ public class Issue93OrphanClassifierTests
             "ProcessorCount": 2,
             "MemoryMB": 2048,
             "UptimeSeconds": 7200,
-            "Reason": "unknown-age"
+            "Reason": "needs-attention"
           }
         ]
         """;
@@ -213,17 +216,17 @@ public class Issue93OrphanClassifierTests
         var result = await manager.CleanupOrphansAsync(LocalHostId, dryRun: dryRun);
 
         result.Should().HaveCount(1,
-            "unknown-age rows are ALWAYS reported regardless of dryRun (LF-D10 fail-closed).");
-        result[0].Reason.Should().Be("unknown-age");
+            "needs-attention rows are ALWAYS reported regardless of dryRun (CO-D3 fail-closed).");
+        result[0].Reason.Should().Be("needs-attention");
 
         // Predicate-authoring invariant: the destroy gate is restricted to
-        // 'orphan' AND -not $dryRun, so unknown-age can NEVER enter the destroy
-        // block, even with dryRun:false. This is the script-side proof that
-        // Stop-VM/Remove-VM are not invocable for this row.
-        capturedScript.Should().Contain("$reason -eq 'orphan' -and -not $dryRun",
-            "destroy must be gated on reason=='orphan' so unknown-age can never be destroyed.");
-        capturedScript.Should().NotContain("$reason -eq 'unknown-age' -and -not $dryRun",
-            "there must be NO destroy branch keyed on 'unknown-age'.");
+        // 'orphan-candidate' AND -not $dryRun, so needs-attention can NEVER enter
+        // the destroy block, even with dryRun:false. This is the script-side proof
+        // that Stop-VM/Remove-VM are not invocable for this row.
+        capturedScript.Should().Contain("$reason -eq 'orphan-candidate' -and -not $dryRun",
+            "destroy must be gated on reason=='orphan-candidate' so needs-attention can never be destroyed.");
+        capturedScript.Should().NotContain("$reason -eq 'needs-attention' -and -not $dryRun",
+            "there must be NO destroy branch keyed on 'needs-attention'.");
 
         var expectedFlag = dryRun ? "$dryRun = $true" : "$dryRun = $false";
         capturedScript.Should().Contain(expectedFlag,
@@ -266,28 +269,27 @@ public class Issue93OrphanClassifierTests
         // LF-D10 regex-shape invariant: the created= capture must exclude both
         // whitespace and ';' so trailing tag segments (e.g. ';type=iso-install'
         // emitted by vm_os_install) don't get glued onto the timestamp capture
-        // and force every iso-installed VM into 'unknown-age' forever.
-        capturedScript.Should().Contain("hyper-v-mcp:created=([^\\s;]+)",
+        // and force every iso-installed VM into 'needs-attention' forever.
+        capturedScript.Should().Contain("(?:^|[\\s;])hyper-v-mcp:created=([^\\s;]+)",
             "the timestamp capture must exclude ';' so multi-segment tag notes parse correctly.");
     }
 
-    // ─── (f) Tagged VM with NO 'created=' segment → unknown-age ─────────
+    // ─── (f) Tagged VM with NO 'created=' segment → needs-attention ─────
 
     /// <summary>
     /// Scenario (f): a VM whose <c>Notes</c> contain the <c>hyper-v-mcp:</c> tag
     /// but no <c>created=</c> segment at all (separate failure mode from a
-    /// garbled timestamp). Per LF-D10 the script must classify this row as
-    /// <c>unknown-age</c> — reported but never auto-destroyed — rather than
-    /// silently dropping it. We assert two things:
+    /// garbled timestamp). Per the ratified #207 contract the script must
+    /// classify this row as <c>needs-attention</c> — reported but never
+    /// auto-destroyed — rather than silently dropping it. We assert two things:
     ///   1. C# mapping side: when the predicate emits such a row the C# layer
-    ///      surfaces it with <c>Reason="unknown-age"</c>.
-    ///   2. Script-authoring side: the composed script has an <c>else</c>
-    ///      branch on the <c>created=</c> regex that assigns
-    ///      <c>$reason = 'unknown-age'</c>, structurally guaranteeing the
-    ///      contract instead of falling through to the silent-ignore path.
+    ///      surfaces it with <c>Reason="needs-attention"</c>.
+    ///   2. Script-authoring side: the composed script's fail-closed else
+    ///      branch assigns <c>$reason = 'needs-attention'</c>, structurally
+    ///      guaranteeing the contract instead of falling through to silent-ignore.
     /// </summary>
     [Fact]
-    public async Task CleanupOrphansAsync_TaggedWithoutCreatedSegment_MapsToUnknownAge()
+    public async Task CleanupOrphansAsync_TaggedWithoutCreatedSegment_MapsToNeedsAttention()
     {
         var (manager, exec) = BuildManager();
         var json = """
@@ -299,7 +301,7 @@ public class Issue93OrphanClassifierTests
             "ProcessorCount": 2,
             "MemoryMB": 2048,
             "UptimeSeconds": 3600,
-            "Reason": "unknown-age"
+            "Reason": "needs-attention"
           }
         ]
         """;
@@ -315,14 +317,13 @@ public class Issue93OrphanClassifierTests
         var result = await manager.CleanupOrphansAsync(LocalHostId, dryRun: false);
 
         result.Should().HaveCount(1,
-            "tagged VMs missing the 'created=' segment must surface as unknown-age, not be silently dropped.");
-        result[0].Reason.Should().Be("unknown-age");
+            "tagged VMs missing the 'created=' segment must surface as needs-attention, not be silently dropped.");
+        result[0].Reason.Should().Be("needs-attention");
 
-        // Structural proof: the script's regex-miss branch must assign
-        // 'unknown-age' rather than fall through. We look for the literal
-        // assignment that the manager emits in the else-branch.
-        capturedScript.Should().Contain("$reason = 'unknown-age'",
-            "the script must assign 'unknown-age' both on parse failure AND when the 'created=' segment is missing entirely.");
+        // Structural proof: the script's fail-closed else branch must assign
+        // 'needs-attention' rather than fall through.
+        capturedScript.Should().Contain("$reason = 'needs-attention'",
+            "the script must fail closed to 'needs-attention' when the row is not a clean ephemeral+aged orphan.");
     }
 
     // ─── (e) VmInfo.Reason JSON serialization ───────────────────────────
@@ -360,8 +361,8 @@ public class Issue93OrphanClassifierTests
     /// preserved — this is how cleanup-orphans rows convey their classification.
     /// </summary>
     [Theory]
-    [InlineData("orphan")]
-    [InlineData("unknown-age")]
+    [InlineData("orphan-candidate")]
+    [InlineData("needs-attention")]
     public void VmInfo_Reason_NonNull_SerializesAsLowercaseProperty(string reason)
     {
         var info = new VmInfo

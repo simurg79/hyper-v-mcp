@@ -93,7 +93,7 @@ public class CheckpointManager : ICheckpointManager
         }
 
         // No downgrade — run original failure-mapping path.
-        HandleError(result, hostProfile.HostId, safeVmId);
+        HandleError(result, hostProfile.HostId, safeVmId, "create");
         // HandleError always throws on !Success; the next line is for the compiler.
         return ParseCheckpointResult(result.Stdout, checkpointName, CreateValidator);
     }
@@ -143,7 +143,7 @@ $matchingCps[0] | Restore-VMCheckpoint -Confirm:$false
             checkpointName, safeVmId, hostId);
 
         var result = await _psExecutor.ExecuteAsync(script, timeoutSeconds: 120, ct: ct);
-        HandleError(result, hostProfile.HostId, safeVmId);
+        HandleError(result, hostProfile.HostId, safeVmId, "restore");
 
         // CP-D3: Invalidate cached session after restore — the VM's OS state has changed
         // so any existing PSSession is stale.
@@ -192,7 +192,7 @@ foreach ($cp in $checkpoints) {{
         _logger.LogDebug("Listing checkpoints for VM '{VmId}' on host '{HostId}'", safeVmId, hostId);
 
         var result = await _psExecutor.ExecuteAsync(script, timeoutSeconds: 60, ct: ct);
-        HandleError(result, hostProfile.HostId, safeVmId);
+        HandleError(result, hostProfile.HostId, safeVmId, "list");
 
         return ParseCheckpointResult(result.Stdout, requestedName: null, ListValidator);
     }
@@ -237,7 +237,7 @@ $matchingCps[0] | Remove-VMCheckpoint -Confirm:$false
             checkpointName, safeVmId, hostId);
 
         var result = await _psExecutor.ExecuteAsync(script, timeoutSeconds: 120, ct: ct);
-        HandleError(result, hostProfile.HostId, safeVmId);
+        HandleError(result, hostProfile.HostId, safeVmId, "delete");
 
         return ParseCheckpointResult(result.Stdout, checkpointName, DeleteValidator);
     }
@@ -285,9 +285,9 @@ if ($all.Count -eq 0) {{
 # Detect branched tree: any node referenced as ParentSnapshotId by more than one child
 $childrenByParent = @{{}}
 foreach ($s in $all) {{
-    $pid = if ($s.ParentSnapshotId) {{ $s.ParentSnapshotId.ToString() }} else {{ '<root>' }}
-    if (-not $childrenByParent.ContainsKey($pid)) {{ $childrenByParent[$pid] = 0 }}
-    $childrenByParent[$pid] = $childrenByParent[$pid] + 1
+    $parentId = if ($s.ParentSnapshotId) {{ $s.ParentSnapshotId.ToString() }} else {{ '<root>' }}
+    if (-not $childrenByParent.ContainsKey($parentId)) {{ $childrenByParent[$parentId] = 0 }}
+    $childrenByParent[$parentId] = $childrenByParent[$parentId] + 1
 }}
 foreach ($k in $childrenByParent.Keys) {{
     if ($childrenByParent[$k] -gt 1) {{
@@ -591,7 +591,7 @@ if (-not $vm) {{ throw ""VM not found: {safeVmId}"" }}
 # VC-CE-D5 (in-script defense-in-depth duplicate of host-side preIds; the C#-supplied
 # list is authoritative for the diff).
 $preIds = New-Object 'System.Collections.Generic.HashSet[string]'
-foreach ($pid in {preIdLiteral}) {{ [void]$preIds.Add($pid) }}
+foreach ($preIdEntry in {preIdLiteral}) {{ [void]$preIds.Add($preIdEntry) }}
 $inScriptPre = @(Get-VMCheckpoint -VMName $vm.Name -ComputerName localhost -ErrorAction SilentlyContinue)
 foreach ($p in $inScriptPre) {{ [void]$preIds.Add($p.Id.ToString()) }}
 
@@ -668,13 +668,29 @@ if ($cp -eq $null) {{
     /// Throws CheckpointFailedException for checkpoint-specific errors, VmNotFoundException
     /// for VM not found errors, and CheckpointFailedException as default for all other errors
     /// (so ErrorMapper maps to CHECKPOINT_FAILED instead of COMMAND_FAILED).
+    ///
+    /// Issue #125 / CPF-D6: instance method (was static) so it can LogWarning the exit code
+    /// + stderr before throwing, giving operators a triage record alongside the wire-level
+    /// diagnostic CPF-D1 forwards. <paramref name="action"/> records which operation failed.
+    /// See /myplans/vm-management/checkpoints/vm-checkpoint-failed-diagnosability-design.md.
     /// </summary>
-    private static void HandleError(PowerShellResult result, string hostId, string vmId)
+    private void HandleError(PowerShellResult result, string hostId, string vmId, string action)
     {
         if (result.Success)
             return;
 
         var errorText = result.Stderr;
+
+        // CPF-D6: log via ILogger ONLY — never stdout, which is reserved for the JSON
+        // envelope (a stray write corrupts the protocol). Sanitize the FULL stderr with
+        // the wire path's chain (ErrorMapper.SanitizeCheckpointDiagnostic) BEFORE
+        // truncating, so a secret straddling the 512-char boundary can't leak into the
+        // preview.
+        var sanitizedStderrPreview = Truncate(
+            ErrorMapper.SanitizeCheckpointDiagnostic(errorText), 512);
+        _logger.LogWarning(
+            "CHECKPOINT_FAILED for host '{HostId}' VM '{VmId}' action '{Action}': exitCode={ExitCode}, stderrPreview='{StderrPreview}'.",
+            hostId, vmId, action, result.ExitCode, sanitizedStderrPreview);
 
         // VM not found errors → VmNotFoundException
         if (ContainsAny(errorText, "VM not found", "does not exist", "could not find"))
