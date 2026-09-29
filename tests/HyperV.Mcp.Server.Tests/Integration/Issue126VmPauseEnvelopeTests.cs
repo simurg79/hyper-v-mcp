@@ -121,12 +121,12 @@ public class Issue126VmPauseEnvelopeTests
     public async Task VmPause_Dispatched_Envelope_Has_DataState_Paused()
     {
         var (dispatcher, exec) = BuildDispatcherWithRealManager();
-        // Hyper-V State enum: 6 = Paused. Shape mirrors what Suspend-VM | Get-VM | ConvertTo-Json yields.
+        // Shape mirrors the production projection: State is the stringified Get-VM enum name.
         var pausedJson = $$"""
         {
           "Id": "{{TestVmId}}",
           "Name": "test-vm",
-          "State": 6,
+          "State": "Paused",
           "ProcessorCount": 2,
           "MemoryMB": 2048,
           "UptimeSeconds": 60
@@ -166,8 +166,8 @@ public class Issue126VmPauseEnvelopeTests
         data.TryGetProperty("state", out var state).Should().BeTrue(
             "VmInfo on the wire must expose a 'state' property (lowercase) — issue #126 surface.");
         state.GetString().Should().Be("Paused",
-            "issue #126 regression guard: data.state MUST be the exact string 'Paused' when " +
-            "Suspend-VM returns a State=6 payload. A regression to Save-VM (State=3 → 'Saving') " +
-            "or any envelope mis-projection would surface here as the wrong literal.");
+            "issue #126 regression guard: data.state MUST be the exact string 'Paused' when the " +
+            "host projects a Paused VM. A regression to a save-to-disk verb ('Saved') or any " +
+            "envelope mis-projection would surface here as the wrong literal.");
     }
 }

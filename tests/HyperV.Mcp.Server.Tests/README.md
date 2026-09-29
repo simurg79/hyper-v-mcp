@@ -2,7 +2,7 @@
 
 ## Overview
 
-This test suite defines the **expected MCP behavior contract** for the Hyper-V MCP Server using a **test-first** approach. Tests are written _before_ implementation to codify the design decisions captured in the project's internal design notes.
+This test suite defines the **expected MCP behavior contract** for the Hyper-V MCP Server using a **test-first** approach. Tests are written _before_ implementation to codify the design decisions from the design documents (internal reference).
 
 ## Test Structure
 
@@ -31,6 +31,15 @@ tests/HyperV.Mcp.Server.Tests/
 ```bash
 # Run all tests and see the authoritative count
 dotnet test --verbosity normal
+```
+
+`dotnet test` also runs the Python suite for the Ubuntu autoinstall ISO
+preparation helper: [`Runtime/Issue358PreparationHelperPythonSuiteTests.cs`](Runtime/Issue358PreparationHelperPythonSuiteTests.cs)
+shells out to `scripts/test_prepare_ubuntu_autoinstall_iso.py`. It can also be
+run directly:
+
+```bash
+python scripts/test_prepare_ubuntu_autoinstall_iso.py
 ```
 
 > **Note:** Test counts below are intentionally omitted to avoid documentation drift.
@@ -67,7 +76,19 @@ Runtime tests exercise real implementations of `ToolDispatcher`, `HostResolver`,
 
 ## Key Design References
 
-Each test file's doc comments cite the specific internal design-doc sections (MCP-D*, CC-D*, CMD-D*, and so on) that the test pins. Those design documents are maintained in a separate internal vault and are not part of this public repository; the test source itself is the authoritative behavior contract.
+| Test File | Primary Design Docs |
+|-----------|-------------------|
+| `ToolDiscoveryTests.cs` | internal documentation (internal reference) — Complete Tool Catalog |
+| `ErrorEnvelopeTests.cs` | internal documentation (internal reference) — MCP-D2, ADR-8, Error Code Taxonomy |
+| `RemotingContractTests.cs` | internal documentation (internal reference) — MCP-D3, Host Connection Configuration |
+| `ConcurrencyTests.cs` | internal documentation (internal reference) — CC-D1 through CC-D7 |
+| `ToolDispatchTests.cs` | internal documentation (internal reference) — MCP-D1, MCP-D6 |
+| `HostResolutionTests.cs` | internal documentation (internal reference) — Host Connection Configuration |
+| `ConcurrencyGateRuntimeTests.cs` | internal documentation (internal reference) — CC-D1 through CC-D4 |
+| `ErrorMappingRuntimeTests.cs` | internal documentation (internal reference) — MCP-D6, Error Code Taxonomy |
+| `TimeoutBehaviorTests.cs` | internal documentation (internal reference) — CMD-D4, ADR-9 |
+| `VmLifecycleFlowTests.cs` | internal documentation (internal reference) — Capability Matrix |
+| `CheckpointFileTransferRemotingFlowTests.cs` | internal documentation (internal reference), internal documentation (internal reference) |
 
 ## Conventions
 

@@ -32,9 +32,9 @@ public class McpToolResponse
     public string? State { get; set; }
 
     /// <summary>
-    /// Optional structured error details. Currently carries the
-    /// <c>vm_create</c> rollback block per LF-D17 (Issue #164):
-    /// <c>{ vmName, phase, rollback: { performed, succeeded, elapsedMs, residualArtifacts } }</c>.
+    /// Optional structured error details. The shape varies by failure: a <c>vm_create</c> rollback
+    /// block, a Linux provisioning block (<c>failingStep</c> plus an optional sanitized
+    /// <c>cause</c>/<c>causeTruncated</c>), or a checkpoint diagnostic block.
     /// Null on success and on errors that do not produce a structured detail body.
     /// </summary>
     [JsonPropertyName("details")]

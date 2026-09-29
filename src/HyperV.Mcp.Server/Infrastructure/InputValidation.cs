@@ -53,6 +53,19 @@ public static class InputValidation
     };
 
     /// <summary>
+    /// Allowed shell values for the Linux SSH guest path (LGS-SSH-D3). Kept separate from
+    /// <see cref="AllowedShells"/> so the Windows validation surface is byte-unchanged.
+    /// Ubuntu-24.04-scoped: the guest login shell (<c>default</c>) or an explicit
+    /// <c>bash</c>/<c>sh</c>. Host-property driven via
+    /// <see cref="Configuration.HostProfile.IsLinuxGuest"/>; runtime OS auto-probe (OQ-LGS-5) deferred.
+    /// See internal documentation — LGS-SSH-D3.
+    /// </summary>
+    private static readonly HashSet<string> AllowedLinuxShells = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "bash", "sh", "default"
+    };
+
+    /// <summary>
     /// Validates that a vmId is a well-formed GUID and returns the canonical string form.
     /// This prevents PowerShell injection via vmId parameters, since GUIDs are safe for
     /// interpolation in PowerShell scripts.
@@ -89,6 +102,27 @@ public static class InputValidation
         if (!AllowedShells.Contains(shell))
             throw new ArgumentException(
                 $"Invalid shell '{shell}'. Allowed values: cmd, powershell, pwsh", nameof(shell));
+
+        return shell.ToLowerInvariant();
+    }
+
+    /// <summary>
+    /// Validates a shell parameter for the Linux SSH guest path (LGS-SSH-D3). Accepts only
+    /// <c>bash</c>, <c>sh</c>, or <c>default</c> (the guest login shell). Rejects everything
+    /// else — including the Windows shells — so a Linux-routed call cannot smuggle a
+    /// Windows-shell token, and the Windows <see cref="ValidateShell"/> surface stays intact.
+    /// </summary>
+    /// <param name="shell">The shell name to validate.</param>
+    /// <returns>The validated shell name (lowercase).</returns>
+    /// <exception cref="ArgumentException">Thrown when shell is not in the allowed Linux set.</exception>
+    public static string ValidateLinuxShell(string shell)
+    {
+        if (string.IsNullOrWhiteSpace(shell))
+            throw new ArgumentException("shell must not be null or empty.", nameof(shell));
+
+        if (!AllowedLinuxShells.Contains(shell))
+            throw new ArgumentException(
+                $"Invalid Linux shell '{shell}'. Allowed values: bash, sh, default", nameof(shell));
 
         return shell.ToLowerInvariant();
     }
@@ -217,13 +251,46 @@ public static class InputValidation
     /// <exception cref="ArgumentException">Thrown when the password is invalid.</exception>
     public static string ValidateAdminPassword(string password)
     {
-        if (string.IsNullOrEmpty(password))
-            throw new ArgumentException("Admin password must not be null or empty.", nameof(password));
+        // Whitespace-only is rejected too: it is accepted by neither Windows Setup nor a later
+        // logon, so it must fail before the call acquires locks and creates artifacts.
+        if (string.IsNullOrWhiteSpace(password))
+            throw new ArgumentException(
+                "Admin password must not be null, empty, or whitespace.", nameof(password));
 
         if (password.Length < 8)
             throw new ArgumentException(
                 "Admin password must be at least 8 characters long.", nameof(password));
 
         return password;
+    }
+
+    /// <summary>
+    /// Conservative Linux-username charset for the Ubuntu <c>guestUsername</c> input (OQ-U4):
+    /// lowercase start (letter or underscore) then up to 31 more of <c>[a-z0-9_-]</c>. Rejects
+    /// names <c>useradd</c> would mangle (leading digit, length &gt; 32, uppercase, reserved
+    /// punctuation) before they reach cloud-init.
+    /// See internal documentation — OQ-U4.
+    /// </summary>
+    private static readonly Regex UbuntuGuestUsername = new(
+        @"^[a-z_][a-z0-9_-]{0,31}$", RegexOptions.Compiled);
+
+    /// <summary>
+    /// Validates the Ubuntu initial-login username (ISO-D24 / OQ-U4). Invalid input throws an early
+    /// <see cref="ArgumentException"/> (→ <c>INVALID_PARAMETER</c>). Windows ignores <c>guestUsername</c>.
+    /// </summary>
+    /// <param name="username">The caller-supplied Ubuntu username.</param>
+    /// <returns>The validated username (unchanged) on success.</returns>
+    /// <exception cref="ArgumentException">Thrown when the username is null/empty or malformed.</exception>
+    public static string ValidateGuestUsername(string? username)
+    {
+        if (string.IsNullOrWhiteSpace(username))
+            throw new ArgumentException("guestUsername must not be null, empty, or whitespace.", nameof(username));
+
+        if (!UbuntuGuestUsername.IsMatch(username))
+            throw new ArgumentException(
+                "guestUsername must match ^[a-z_][a-z0-9_-]{0,31}$ (lowercase, start with a letter or " +
+                "underscore, max 32 characters).", nameof(username));
+
+        return username;
     }
 }

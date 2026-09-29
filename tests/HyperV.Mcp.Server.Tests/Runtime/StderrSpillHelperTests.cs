@@ -357,6 +357,92 @@ public class StderrSpillHelperTests
         }
     }
 
+    /// <summary>
+    /// Issue #209 / LGS-SSH-D6: <see cref="StderrSpillHelper.RedactDefensively"/> must strip a
+    /// full multi-line PEM/OpenSSH private-key block (BEGIN…PRIVATE KEY / END…PRIVATE KEY),
+    /// including the base64 body, so SSH stdout/stderr/exception text echoing key material can
+    /// never reach a CommandResult, error string, or log. Surrounding noise must survive.
+    /// </summary>
+    [Theory]
+    [InlineData("RSA")]
+    [InlineData("OPENSSH")]
+    [InlineData("EC")]
+    public void RedactDefensively_Strips_Full_PrivateKey_Block(string keyKind)
+    {
+        var keyBlock =
+            $"-----BEGIN {keyKind} PRIVATE KEY-----\n" +
+            "MIIE owIBAAKCAQEA-line-one-secret-body\n" +
+            "line-two-secret-body-MUST-NOT-LEAK\n" +
+            "line-three-secret-body==\n" +
+            $"-----END {keyKind} PRIVATE KEY-----";
+        var text = $"ssh failure dumped the key:\n{keyBlock}\nafter-key trailing diagnostic";
+
+        var redacted = StderrSpillHelper.RedactDefensively(text);
+
+        redacted.Should().NotContain("PRIVATE KEY-----",
+            "the BEGIN/END private-key markers must be removed.");
+        redacted.Should().NotContain("secret-body",
+            "no fragment of the multi-line base64 key body may survive.");
+        redacted.Should().NotContain("MUST-NOT-LEAK");
+        redacted.Should().Contain("***REDACTED-PRIVATE-KEY***");
+        redacted.Should().Contain("after-key trailing diagnostic",
+            "redaction must remove only the key block, not the surrounding text.");
+    }
+
+    /// <summary>
+    /// Issue #209 / LGS-SSH-D6: PGP private-key armor uses the ` PRIVATE KEY BLOCK` marker
+    /// variant. The defensive redactor must strip that whole armored block too — a distinct secret
+    /// class that must be caught by the same seam.
+    /// </summary>
+    [Fact]
+    public void RedactDefensively_Strips_Pgp_PrivateKey_Block()
+    {
+        const string pgpBlock =
+            "-----BEGIN PGP PRIVATE KEY BLOCK-----\n" +
+            "Version: GnuPG v2\n" +
+            "\n" +
+            "lQHYBF-pgp-secret-body-MUST-NOT-LEAK-line-1\n" +
+            "pgp-secret-body-line-2==\n" +
+            "-----END PGP PRIVATE KEY BLOCK-----";
+        var text = $"leaked pgp key:\n{pgpBlock}\ntrailing pgp noise";
+
+        var redacted = StderrSpillHelper.RedactDefensively(text);
+
+        redacted.Should().NotContain("PGP PRIVATE KEY BLOCK",
+            "the PGP armor markers must be removed.");
+        redacted.Should().NotContain("pgp-secret-body",
+            "no fragment of the PGP private-key body may survive.");
+        redacted.Should().NotContain("MUST-NOT-LEAK");
+        redacted.Should().Contain("***REDACTED-PRIVATE-KEY***");
+        redacted.Should().Contain("trailing pgp noise");
+    }
+
+    /// <summary>
+    /// Issue #209 / LGS-SSH-D6: password redaction on the SSH path still works — the literal
+    /// HYPERV_MCP_VM_PASSWORD value is stripped from arbitrary text by the same seam the SSH
+    /// channel routes stdout/stderr/error strings through.
+    /// </summary>
+    [Fact]
+    public void RedactDefensively_Strips_Configured_Password_Literal()
+    {
+        const string secret = "Ssh-P@ss-UNIQUE-209b3d";
+        var origPw = Environment.GetEnvironmentVariable(CredentialResolver.EnvVarPassword);
+        Environment.SetEnvironmentVariable(CredentialResolver.EnvVarPassword, secret);
+        try
+        {
+            var redacted = StderrSpillHelper.RedactDefensively(
+                $"ssh stderr echoed the password {secret} verbatim");
+
+            redacted.Should().NotContain(secret,
+                "LGS-SSH-D6: the configured password literal must never survive redaction.");
+            redacted.Should().Contain("***REDACTED***");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(CredentialResolver.EnvVarPassword, origPw);
+        }
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────
 
     private static string? ExtractSpillPath(string summary)
