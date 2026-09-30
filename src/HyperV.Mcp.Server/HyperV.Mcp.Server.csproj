@@ -9,15 +9,15 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="ModelContextProtocol" Version="1.4.0" />
+    <PackageReference Include="ModelContextProtocol" Version="1.4.1" />
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.9" />
-    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.9" />
-    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="10.0.9" />
-    <PackageReference Include="Microsoft.Extensions.Configuration.Binder" Version="10.0.9" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.12" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="10.0.12" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Binder" Version="10.0.12" />
     <!-- Phase 2 (issue #52): in-process PowerShell SDK runspace for IPowerShellHost.
          See /myplans/remoting/powershell-direct/powershell-direct-design.md — PSD-D5.
          MUST stay on the 7.4.x line: 7.5+ targets net9/net10 but this project is net8.0-windows. -->
-    <PackageReference Include="Microsoft.PowerShell.SDK" Version="7.4.17" />
+    <PackageReference Include="Microsoft.PowerShell.SDK" Version="7.4.20" />
     <!-- Linux-guest SSH-exec first slice (issue #209 / LGS-SSH-D2). SSH.NET is the
          de-facto pure-managed SSH client for .NET (no native deps, net8.0-compatible);
          used only by the SSH guest channel for Linux guests. The Windows PSDirect path
