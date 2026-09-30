@@ -26,6 +26,9 @@ Desktop.ini
 # Logs
 *.log
 
+# Python
+scripts/__pycache__/
+
 # Temp files
 *.tmp
 pr-body.md
@@ -42,3 +45,4 @@ myplans
 Parent
 rc10-run-output.txt
 myscripts
+.rooignore

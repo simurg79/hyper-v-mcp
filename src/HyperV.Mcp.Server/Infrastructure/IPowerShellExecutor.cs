@@ -27,6 +27,32 @@ public interface IPowerShellExecutor
     /// </param>
     /// <returns>The execution result with stdout, stderr, exit code, and timing.</returns>
     Task<PowerShellResult> ExecuteAsync(string script, int timeoutSeconds = 300, CancellationToken ct = default, bool allowDump = true);
+
+    /// <summary>
+    /// Execute a script whose secret inputs are supplied out-of-band as child-process environment
+    /// variables instead of being interpolated into the script text.
+    ///
+    /// <para>Needed because <see cref="ExecuteAsync"/> materializes the whole script in a host temp
+    /// <c>.ps1</c> file, so a secret in the script text lands on host disk and survives a crash.
+    /// See internal documentation — FR-14 / FR-16.</para>
+    ///
+    /// <para>Script dumping is always suppressed here. The default implementation throws
+    /// deliberately: an earlier silent forward to <see cref="ExecuteAsync"/> discarded the secret
+    /// values, so a double implementing only <c>ExecuteAsync</c> could report success without any
+    /// secret reaching the child — the masked-mock failure mode that let a defective fix through on
+    /// PR #278. Every implementation and fake on the secret path MUST opt in explicitly.</para>
+    /// </summary>
+    /// <param name="script">The script; it reads each secret via <c>$env:NAME</c>.</param>
+    /// <param name="secretEnvironment">Environment variable name/value pairs for the child process.</param>
+    /// <param name="timeoutSeconds">Maximum execution time in seconds. 0 = no timeout.</param>
+    /// <param name="ct">Cancellation token.</param>
+    Task<PowerShellResult> ExecuteWithSecretsAsync(
+        string script,
+        IReadOnlyDictionary<string, string> secretEnvironment,
+        int timeoutSeconds = 300,
+        CancellationToken ct = default)
+        => throw new NotSupportedException(
+            $"{GetType().Name} does not implement ExecuteWithSecretsAsync; secret-bearing execution must be implemented explicitly.");
 }
 
 /// <summary>

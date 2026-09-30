@@ -3,24 +3,13 @@ using System.Text.Json;
 using HyperV.Mcp.Server.Configuration;
 using HyperV.Mcp.Server.Models;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace HyperV.Mcp.Server.Infrastructure;
 
-/// <summary>
-/// Manages Hyper-V virtual machines via PowerShell cmdlets executed through <see cref="IPowerShellExecutor"/>.
-/// See internal documentation — VM lifecycle operations.
-///
-/// Phase 1 implementation: local host only. Remote hosts (WinRM) will be added in a future phase.
-/// Each method composes a PowerShell script that outputs JSON, then parses the result into <see cref="VmInfo"/>.
-///
-/// Design decisions:
-/// - LF-D1: vm_create performs creation + start as single atomic operation (bootstrap deferred to Stage 1.4).
-///   See internal documentation
-/// - LF-D3: vm_destroy performs hard power-off (Stop-VM -TurnOff), not graceful shutdown.
-///   See internal documentation
-/// - LF-D4: Tag VMs with "hyper-v-mcp:created={ISO8601}" in Hyper-V Notes field.
-///   See internal documentation
-/// </summary>
+/// <summary>Local-only VM lifecycle via PowerShell JSON scripts; WinRM is deferred.
+/// vm_create atomically creates and starts the VM; bootstrap is deferred. vm_destroy uses hard power-off.
+/// VM Notes carry "hyper-v-mcp:created={ISO8601};role=ephemeral".</summary>
 public class HyperVManager : IHyperVManager
 {
     private readonly IPowerShellExecutor _psExecutor;
@@ -29,53 +18,72 @@ public class HyperVManager : IHyperVManager
     private readonly ILogger<HyperVManager> _logger;
     private readonly IIsoInspector _isoInspector;
 
+    // Optional constructor dependencies preserve direct-construction fixtures; production DI supplies real singletons.
+    private readonly IGuestOsClassifier _guestOsClassifier;
+    private readonly IUbuntuAutoinstallOrchestrator _ubuntuOrchestrator;
+    private readonly IGuestRoutingHintStore _guestRoutingHintStore;
+
+    // optional in the constructor so direct-construction test fixtures keep compiling;
+    // production DI supplies the real singletons.
+    private readonly IBaseImageGeneralizationProbe _generalizationProbe;
+    private readonly IUnattendSeeder _unattendSeeder;
+    private readonly IGuestReadinessPoller _readinessPoller;
+    private readonly IGuestOsProbe _readinessOsProbe;
+    private readonly ReadinessAuthenticator _readinessAuthenticator;
+    private readonly TimeProvider _readinessClock;
+    private readonly Func<string, int, CancellationToken, Task<bool>> _readinessBannerProbe;
+
+    /// <summary>
+    /// A password-bearing first boot is slower than an unseeded one, so the readiness limit is
+    /// never allowed below this floor even when the create budget is lower.
+    /// </summary>
+    internal const int MinimumReadinessLimitSeconds = 150;
+
+    /// <summary>
+    /// Slack over the readiness limit before the poll's own token fires, so the script reports its
+    /// own DEADLINE verdict instead of being cancelled out from under it.
+    /// </summary>
+    private const int ReadinessCancellationGraceSeconds = 60;
+
     /// <summary>
     /// Default storage root when not configured via environment variable or host profile.
     /// </summary>
     private const string DefaultStorageRoot = @"C:\HyperVMCP\VMs";
 
     /// <summary>
-    /// Hyper-V VM state enum values mapped to human-readable names.
-    /// See https://learn.microsoft.com/en-us/dotnet/api/microsoft.hyperv.powershell.vmstate
+    /// Secondary fallback only: names a numeric <c>State</c> that still arrives from a legacy or
+    /// cached payload. Values are the measured <c>Microsoft.HyperV.PowerShell.VMState</c> ordinals,
+    /// NOT the CIM <c>EnabledState</c> vocabulary the earlier table wrongly encoded.
     /// </summary>
-    private static readonly Dictionary<int, string> VmStateMap = new()
+    private static readonly Dictionary<int, string> LegacyNumericVmStateFallback = new()
     {
-        { 1, "Other" },
         { 2, "Running" },
         { 3, "Off" },
         { 4, "Stopping" },
-        { 5, "Saved" },
-        { 6, "Paused" },
-        { 7, "Starting" },
-        { 8, "Reset" },
-        { 9, "Saving" },
-        { 10, "PausedCritical" },
-        { 11, "SavedCritical" },
-        { 12, "FastSaved" },
-        { 13, "FastSavedCritical" },
+        { 6, "Saved" },
+        { 9, "Paused" },
+        { 10, "Starting" },
+        { 32773, "Saving" },
+        { 32776, "Pausing" },
     };
 
     private readonly IFileSystemProbe _fileSystemProbe;
     private readonly IBaseImageHashCache? _baseImageHashCache;
 
     /// <summary>
-    /// Default LF-D17 rollback budget (seconds). Overridable via
+    /// Default rollback budget (seconds). Overridable via
     /// <c>HYPERV_MCP_VM_CREATE_ROLLBACK_BUDGET_SECONDS</c>.
     /// </summary>
     private const int DefaultRollbackBudgetSeconds = 30;
 
-    /// <summary>Environment variable for the LF-D17 rollback budget.</summary>
+    /// <summary>Environment variable for the rollback budget.</summary>
     private const string RollbackBudgetEnvVar = "HYPERV_MCP_VM_CREATE_ROLLBACK_BUDGET_SECONDS";
 
-    /// <summary>
-    /// PB-D2: Shared <c>Select-Object</c> projection used by the seven VM lifecycle
-    /// methods (Start/Stop/Restart/Pause/Resume/Configure/GetVmStatus). The string is
-    /// the pipe right-hand side only (no leading <c>|</c>); the helper template in
-    /// <see cref="RunSingleVmActionAsync"/> supplies the pipe. The literal
-    /// <c>MemoryStartup/1MB</c> is load-bearing — multiple tests grep for it.
-    /// </summary>
+    /// <summary>Shared projection for Start/Stop/Restart/Pause/Resume/Configure/GetVmStatus; the helper supplies the pipe.
+    /// Tests require the literal <c>MemoryStartup/1MB</c>. State names avoid private VMState ordinals, which have drifted.</summary>
     private const string VmInfoProjection =
-        "Select-Object Id, Name, State, ProcessorCount, "
+        "Select-Object Id, Name, ProcessorCount, "
+        + "@{N='State';E={[string]$_.State}}, "
         + "@{N='MemoryMB';E={$_.MemoryStartup/1MB}}, "
         + "@{N='UptimeSeconds';E={$_.Uptime.TotalSeconds}}";
 
@@ -86,45 +94,73 @@ public class HyperVManager : IHyperVManager
         ILogger<HyperVManager> logger,
         IIsoInspector isoInspector,
         IFileSystemProbe? fileSystemProbe = null,
-        IBaseImageHashCache? baseImageHashCache = null)
+        IBaseImageHashCache? baseImageHashCache = null,
+        IGuestOsClassifier? guestOsClassifier = null,
+        IUbuntuAutoinstallOrchestrator? ubuntuOrchestrator = null,
+        IGuestRoutingHintStore? guestRoutingHintStore = null,
+        IBaseImageGeneralizationProbe? generalizationProbe = null,
+        IUnattendSeeder? unattendSeeder = null,
+        IGuestReadinessPoller? readinessPoller = null,
+        IGuestOsProbe? guestOsProbe = null,
+        IPowerShellHost? psHost = null,
+        ISshExecClientFactory? sshExecClientFactory = null,
+        TimeProvider? readinessClock = null,
+        Func<string, int, CancellationToken, Task<bool>>? readinessBannerProbe = null)
     {
         _psExecutor = psExecutor ?? throw new ArgumentNullException(nameof(psExecutor));
         _hostResolver = hostResolver ?? throw new ArgumentNullException(nameof(hostResolver));
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _isoInspector = isoInspector ?? throw new ArgumentNullException(nameof(isoInspector));
-        // Issue #73: filesystem-probe seam. Defaults to the production implementation
-        // so existing call sites (tests, harnesses) need not be threaded with a
-        // new dependency. DI resolves the registered singleton in production.
+        _readinessClock = readinessClock ?? TimeProvider.System;
+        _readinessOsProbe = guestOsProbe
+            ?? new KvpGuestOsProbe(psExecutor, hostResolver, NullLogger<KvpGuestOsProbe>.Instance);
+        _readinessAuthenticator = new ReadinessAuthenticator(
+            psHost, sshExecClientFactory ?? new SshExecClientFactory(), logger);
+        _readinessBannerProbe = readinessBannerProbe ?? KvpGuestOsProbe.RespondsWithSshBannerAsync;
+        // default the classifier and Ubuntu orchestrator to production
+        // implementations when not injected, so direct-construction test fixtures keep working.
+        _guestOsClassifier = guestOsClassifier
+            ?? new GuestOsClassifier(_isoInspector, NullLogger<GuestOsClassifier>.Instance);
+        // Share the hint store so installer hints reach the router and SshSessionStore.
+        // The isolated fallback preserves source compatibility but warns: silent isolation can hide broken routing in tests.
+        if (guestRoutingHintStore is null)
+        {
+            _logger.LogWarning(
+                "HyperVManager was constructed without a shared IGuestRoutingHintStore; install-time guest-routing hints will be recorded into an isolated store and will NOT reach GuestChannelRouter or SshSessionStore.");
+        }
+        _guestRoutingHintStore = guestRoutingHintStore ?? new GuestRoutingHintStore();
+        _ubuntuOrchestrator = ubuntuOrchestrator
+            ?? new UbuntuAutoinstallOrchestrator(
+                _psExecutor,
+                new KvpCompletionReader(_psExecutor, NullLogger<KvpCompletionReader>.Instance),
+                _hostResolver,
+                new SystemTempPathProvider(),
+                _guestRoutingHintStore,
+                new SeedMediaAuthor(
+                    _psExecutor,
+                    new OscdimgProbe(new SystemEnvironment()),
+                    NullLogger<SeedMediaAuthor>.Instance),
+                NullLogger<UbuntuAutoinstallOrchestrator>.Instance);
+        // The production fallback preserves existing constructor call sites; DI supplies the registered singleton.
         _fileSystemProbe = fileSystemProbe ?? new FileSystemProbe();
-        // Issue #164 / ST-D6a: pre-hash cache for base VHDX mutation guard.
-        // Optional in the constructor so existing test fixtures need not pass it;
-        // when null, CreateVmAsync degrades to per-call SHA-256 inside the host
-        // process (still off the PowerShell pipeline) using a transient cache.
+        // The optional cache preserves existing direct-construction fixtures.
         _baseImageHashCache = baseImageHashCache;
+        _generalizationProbe = generalizationProbe
+            ?? new BaseImageGeneralizationProbe(_psExecutor, NullLogger<BaseImageGeneralizationProbe>.Instance);
+        _unattendSeeder = unattendSeeder
+            ?? new UnattendSeeder(_psExecutor, NullLogger<UnattendSeeder>.Instance);
+        _readinessPoller = readinessPoller
+            ?? new GuestReadinessPoller(_psExecutor, NullLogger<GuestReadinessPoller>.Instance);
 
         _logger.LogInformation("Base VHDX mutation guard active (ADR-4 / ST-D6 + ST-D6a + VC-D8): ReadOnly attribute + force-recomputed post-create SHA-256.");
     }
 
     /// <inheritdoc />
-    /// <remarks>
-    /// LF-D1: Creates VM + attaches differencing VHDX as single atomic operation.
-    /// When autoStart is true, the VM is started after creation;
-    /// when false (default), it remains in Off state.
-    /// LF-D4: Tags VM with "hyper-v-mcp:created={ISO8601}" in Notes field.
-    ///
-    /// Phase 1 limitation: CreateVmAsync creates (and optionally starts) the VM but
-    /// does NOT perform the full bootstrap state machine (OsBooting → OsReady →
-    /// ShellReady → NetworkReady → AppReady). The bootstrap will be completed in a
-    /// follow-up phase. Callers should use vm_wait_ready (P1 tool) or add manual
-    /// delays before running commands on freshly created VMs.
-    /// See internal documentation — Bootstrap State Machine.
-    ///
-    /// Issue 5: Basic rollback added — if Start-VM fails after VM creation, the VM
-    /// and its VHDX are cleaned up to avoid orphaned resources.
-    /// See internal documentation
-    /// </remarks>
-    public async Task<VmInfo> CreateVmAsync(
+    /// <remarks>Atomically creates a VM with a differencing disk and ownership Notes; autoStart defaults to false (Off).
+    /// Full bootstrap (OsBooting → OsReady → ShellReady → NetworkReady → AppReady) is deferred; use vm_wait_ready or manual delays before commands.
+    /// Start failure cleans up the VM and VHDX to prevent orphans.</remarks>
+    public Task<VmInfo> CreateVmAsync(
         string hostId,
         string name,
         string? baseVhdxPath = null,
@@ -133,39 +169,63 @@ public class HyperVManager : IHyperVManager
         bool autoStart = false,
         bool verifyBaseImageHash = true,
         CancellationToken ct = default)
+        => CreateVmAsync(hostId, name, baseVhdxPath, cpuCount, memoryMB, autoStart,
+            verifyBaseImageHash, adminPassword: null, createTimeBudgetSeconds: 0, ct);
+
+    /// <inheritdoc />
+    public async Task<VmInfo> CreateVmAsync(
+        string hostId,
+        string name,
+        string? baseVhdxPath,
+        int cpuCount,
+        long memoryMB,
+        bool autoStart,
+        bool verifyBaseImageHash,
+        string? adminPassword,
+        int createTimeBudgetSeconds,
+        CancellationToken ct)
     {
-        // ── PA-D2: structured-logging stage markers (replaces the retired
-        //    HYPERV_MCP_TRACE_VM_CREATE env-gated `[vm_create-trace]` stderr
-        //    path). Each former __trace(...) call site now emits a single
-        //    LogDebug message under one of two templates:
-        //      (A) "vm_create stage {stage} elapsedMs={elapsedMs} vm={vmName}"
-        //      (B) "vm_create stage {stage} elapsedMs={elapsedMs} vm={vmName} data={@phaseData}"
-        //    Template (B) uses the `@` destructuring hint (honored by sinks
-        //    such as Serilog; treated as a literal property-name prefix by the
-        //    default Microsoft.Extensions.Logging console formatter, which
-        //    surfaces the structured property as `@phaseData`). Downstream log
-        //    queries should match on that exact property name.
-        //    The single total-elapsed Stopwatch and the per-phase stopwatches
-        //    are kept unconditional (cheap) so elapsedMs / *StageMs fields are
-        //    always populated in the structured payload.
+        // Validated here rather than only at the dispatcher, so a direct IHyperVManager caller
+        // cannot smuggle a whitespace-only or too-short password past the same rule.
+        if (adminPassword is not null)
+        {
+            InputValidation.ValidateAdminPassword(adminPassword);
+        }
+
+        var passwordSupplied = adminPassword is not null;
+
+        // Readiness starts at first power-on, so preflight, hashing, cloning and seeding use a separate pre-boot budget.
+        // The caller token bounds both phases; ConfirmLoginReadyAsync gets a full readiness window. No-password behavior is unchanged.
+        var callerCt = ct;
+        using var preBootCts = passwordSupplied && createTimeBudgetSeconds > 0
+            ? CancellationTokenSource.CreateLinkedTokenSource(ct)
+            : null;
+        if (preBootCts is not null)
+        {
+            preBootCts.CancelAfter(TimeSpan.FromSeconds(createTimeBudgetSeconds));
+            ct = preBootCts.Token;
+        }
+
+        // A password-bearing success is defined as login-ready, which cannot be confirmed on a
+        // powered-off VM — so the caller's autoStart is overridden upward, never downward.
+        var effectiveAutoStart = autoStart || passwordSupplied;
+
+        // The primary script must NOT start the VM on the password path: the answer file is written
+        // to the diff disk after the script returns and must be in place before first boot. The
+        // start is re-issued once seeding succeeds, so effectiveAutoStart still holds.
+        var startInPrimaryScript = effectiveAutoStart && !passwordSupplied;
+        // Structured stage logs replace the env-gated trace. Serilog honors @ destructuring; the default console
+        // formatter uses the literal property name @phaseData, which downstream queries must match.
+        // Stopwatches stay unconditional so elapsedMs and per-stage durations are always populated.
         var __traceSw = Stopwatch.StartNew();
         _logger.LogDebug(
             "vm_create stage {stage} elapsedMs={elapsedMs} vm={vmName}",
             "entry", __traceSw.ElapsedMilliseconds, name);
 
-        // VC-D6 / VC-D8 (Issue #169 Gate 6 remediation, Option D′ hybrid):
-        // - Default (verifyBaseImageHash:true): pre-hash via the warm-on-init
-        //   cache + post-create force-recompute (unconditional). Mismatch ⇒
-        //   BASE_IMAGE_MUTATED. Closes the Gate 6 finding #1 gap where the
-        //   cached SHA-256 had become a stored value rather than an enforced
-        //   check (re-served as the post-hash, defeating ST-D6 against
-        //   preserved-stat mutations — Rows 1/4/5 of the §ADR-4 Threat Model).
-        // - Opt-out (verifyBaseImageHash:false): skip both the pre-hash and the
-        //   post-create recompute; mutation guard collapses to ReadOnly-attribute
-        //   only. Operator-accepted ADR-4 trade-off.
+        // Default hashing uses the warm pre-hash and an unconditional post-create recompute to detect preserved-stat mutations;
+        // a mismatch is BASE_IMAGE_MUTATED. Opting out skips both hashes and accepts a ReadOnly-attribute-only guard.
         var hostProfile = ResolveLocalHost(hostId);
 
-        // Resolve base VHDX path: parameter > env var > host profile config.
         var baseVhdx = baseVhdxPath
             ?? Environment.GetEnvironmentVariable("HYPERV_MCP_BASE_VHDX")
             ?? hostProfile.BaseVhdxPath;
@@ -176,7 +236,6 @@ public class HyperVManager : IHyperVManager
                 "No base VHDX path specified. Provide via parameter, HYPERV_MCP_BASE_VHDX environment variable, or host profile configuration.");
         }
 
-        // Resolve storage root: env var > host profile config > default.
         var storageRoot = Environment.GetEnvironmentVariable("HYPERV_MCP_STORAGE_ROOT")
             ?? hostProfile.StorageRoot
             ?? DefaultStorageRoot;
@@ -187,7 +246,6 @@ public class HyperVManager : IHyperVManager
         var vmDir = Path.Combine(storageRoot, name);
         var diffPath = Path.Combine(vmDir, $"{name}.vhdx");
 
-        // Escape single quotes in strings for PowerShell literal embedding.
         var escapedName = EscapePowerShellString(name);
         var escapedBaseVhdx = EscapePowerShellString(baseVhdx);
         var escapedStorageRoot = EscapePowerShellString(storageRoot);
@@ -199,13 +257,8 @@ public class HyperVManager : IHyperVManager
             "validated", __traceSw.ElapsedMilliseconds, name,
             new { baseVhdx, storageRoot });
 
-        // ── Issue #203 / VC-DUP-D1 / LF-D19: pre-create existence probe ──────
-        // MUST run BEFORE any state-mutating call (warm-hash compute is read-only
-        // so we run it after the probe to fail fast on the dominant duplicate-name
-        // case). A non-null Get-VM result short-circuits with the contractually
-        // pinned VM_ALREADY_EXISTS envelope. No artifacts have been created →
-        // there is no LF-D17 rollback to arm → the pre-existing VM cannot be
-        // deleted by our cleanup path.
+        // Probe before mutations or hashing to reject duplicates quickly with VM_ALREADY_EXISTS.
+        // No artifacts exist and rollback is not armed, so a pre-existing VM cannot be deleted.
         if (await VmExistsOnHostAsync(name, ct).ConfigureAwait(false))
         {
             _logger.LogDebug(
@@ -217,27 +270,36 @@ public class HyperVManager : IHyperVManager
             throw new VmAlreadyExistsException(hostProfile.HostId, name);
         }
 
-        // ── ST-D6a: host-side pre-hash via the cache ─────────────────────────
-        // Cheap stat-tuple lookup short-circuits SHA-256 on the warm path. Cold
-        // path computes once and caches for 24h (configurable). Hashing happens
-        // BEFORE the PowerShell pipeline so it is not subject to inbound CT
-        // mid-cancellation (the cache observes the CT but the cancelled task
-        // simply doesn't populate the cache; subsequent calls will retry).
-        // ── 🔴 Bug-fix (Issue #164 loop-back): eagerly snapshot the pre-create
-        // stat tuple. `FileInfo` reads its properties lazily on first access and
-        // caches them, so capturing the `FileInfo` object alone is unsafe: by the
-        // time the post-create comparison reads `preStat.Length` etc., the OS
-        // metadata can have moved and BOTH endpoints end up reading post-state
-        // (silently masking a real mutation). Read the primitives NOW, before the
-        // PowerShell pipeline runs, into a readonly record struct.
+        // Password requests require positively confirmed generalization before any artifacts exist.
+        // Negative and indeterminate results both reject without rollback.
+        if (passwordSupplied)
+        {
+            var generalizationState = await _generalizationProbe
+                .ProbeAsync(baseVhdx, ct).ConfigureAwait(false);
+
+            if (generalizationState != BaseImageGeneralizationState.Generalized)
+            {
+                var indeterminate = generalizationState == BaseImageGeneralizationState.Indeterminate;
+                _logger.LogInformation(
+                    "vm_create rejected password-bearing request for '{VmName}': base image generalization verdict was {Verdict} (no artifacts created).",
+                    name, generalizationState);
+                throw new BaseImageNotGeneralizedException(
+                    indeterminate
+                        ? "The base image could not be confirmed to be sysprepped/generalized, so the supplied administrator password cannot be applied. Retry with a base image you have confirmed is generalized, or create one with vm_create_base_image."
+                        : "The base image is not sysprepped/generalized, so the supplied administrator password cannot be applied. Retry with a generalized base image, or create one with vm_create_base_image.",
+                    indeterminate);
+            }
+        }
+
+        // Warm stat-tuple hits avoid hashing; cold hashes cache for 24h (configurable) before the PowerShell pipeline.
+        // Cancellation leaves the cache unpopulated for retry. Snapshot FileInfo primitives now: lazy reads could otherwise
+        // capture post-create metadata at both endpoints and hide mutation.
         string? preHash = null;
         FileStatSnapshot? preStat = null;
         if (File.Exists(baseVhdx))
         {
             var fi = new FileInfo(baseVhdx);
-            // Eagerly materialize each property into a local primitive. Touching
-            // FileInfo.Refresh() before reading guarantees a single OS round-trip
-            // for this snapshot; subsequent reads of the locals are pure memory.
+            // Refresh before copying primitives so the snapshot uses one OS round-trip, not later lazy reads.
             fi.Refresh();
             preStat = new FileStatSnapshot(
                 Length: fi.Length,
@@ -250,7 +312,7 @@ public class HyperVManager : IHyperVManager
             new { preStatCaptured = preStat is not null });
         try
         {
-            // VC-D6 opt-out path: skip pre-hash entirely when caller asked us
+            // opt-out path: skip pre-hash entirely when caller asked us
             // to. Mutation guard reduces to the ReadOnly-attribute check (still
             // enforced inside the PowerShell BuildBaseVhdxGuardScript helper).
             if (_baseImageHashCache is not null && verifyBaseImageHash)
@@ -259,14 +321,8 @@ public class HyperVManager : IHyperVManager
                     "vm_create stage {stage} elapsedMs={elapsedMs} vm={vmName}",
                     "pre-hash-start", __traceSw.ElapsedMilliseconds, name);
                 var __preHashSw = Stopwatch.StartNew();
-                // VC-D5 (Shape B): the cache's GetOrComputeAsync internally swaps the
-                // inbound CT for a lifetime CTS inside the gate-holder, so the actual
-                // SHA-256 compute is NOT killed by an inbound MCP timeout. We still
-                // want THIS handler to surface -32001 promptly on inbound cancellation
-                // — so we race the cache task against Task.Delay(Infinite, ct) via
-                // Task.WhenAny. On inbound cancellation we throw OperationCanceledException
-                // and let the detached compute continue for the benefit of subsequent
-                // callers (who will join the same per-path semaphore and observe a hit).
+                // Race cancellation so this handler promptly surfaces -32001 while the lifetime-token hash continues.
+                // Later callers share its per-path semaphore and can reuse the result.
                 var cacheTask = _baseImageHashCache.GetOrComputeAsync(baseVhdx, ct);
 
                 if (ct.CanBeCanceled)
@@ -296,10 +352,8 @@ public class HyperVManager : IHyperVManager
                     "pre-hash-skipped", __traceSw.ElapsedMilliseconds, name,
                     new { cacheWired = _baseImageHashCache is not null, verifyBaseImageHash });
             }
-            // When no cache is wired (e.g., legacy test fixtures), we skip the
-            // pre-hash entirely. The PowerShell side no longer performs Get-FileHash,
-            // so the mutation guard collapses to "ReadOnly attribute only" in this
-            // degraded mode. Production code paths always wire the cache via DI.
+            // Without a cache (legacy fixtures), hashing is skipped and the guard is ReadOnly-only;
+            // PowerShell no longer calls Get-FileHash. Production DI always wires the cache.
         }
         catch (FileNotFoundException fnf)
         {
@@ -307,10 +361,7 @@ public class HyperVManager : IHyperVManager
                 $"Base VHDX not found at '{baseVhdx}'. Verify the path or HYPERV_MCP_BASE_VHDX configuration.", fnf);
         }
 
-        // Compose the create script (LF-D1, LF-D4, LF-D7). The script no longer
-        // performs SHA-256 — that is owned host-side by the cache per ST-D6a.
-        // The script also no longer carries an inline catch-block: rollback is now
-        // a separate detached-CTS PowerShell call per LF-D17.
+        // Hashing stays host-side; rollback uses a separate detached-token PowerShell call.
         var script = $@"
 $ErrorActionPreference = 'Stop'
 Import-Module Hyper-V -ErrorAction Stop
@@ -320,10 +371,9 @@ $baseVhdx = '{escapedBaseVhdx}'
 $storageRoot = '{escapedStorageRoot}'
 $memoryBytes = {memoryMB} * 1MB
 $cpuCount = {cpuCount}
-$autoStart = {(autoStart ? "$true" : "$false")}
+$autoStart = {(startInPrimaryScript ? "$true" : "$false")}
 
-# Check if VM already exists
-# WMI workaround (LF-D7): -ComputerName localhost avoids null-name WMI bug
+# WMI workaround : -ComputerName localhost avoids null-name WMI bug
 $existing = Get-VM -Name $name -ComputerName localhost -ErrorAction SilentlyContinue
 if ($existing) {{
     throw ""VM with name '$name' already exists""
@@ -338,24 +388,19 @@ if (-not (Test-Path -LiteralPath $vmDir)) {{
 
 {BuildBaseVhdxGuardScript(escapedBaseVhdx)}
 
-# Create differencing VHDX
-# WMI workaround (LF-D7): -ComputerName localhost avoids null-name WMI bug
+# WMI workaround : -ComputerName localhost avoids null-name WMI bug
 New-VHD -Path $diffPath -ParentPath $baseVhdx -Differencing -ComputerName localhost | Out-Null
 
-# Create Generation 2 VM
 New-VM -Name $name -Generation 2 -MemoryStartupBytes $memoryBytes -VHDPath $diffPath -ComputerName localhost | Out-Null
 Set-VM -Name $name -ProcessorCount $cpuCount -ComputerName localhost
-Set-VM -Name $name -Notes ""hyper-v-mcp:created=$(Get-Date -Format o)"" -ComputerName localhost
+Set-VM -Name $name -Notes ""hyper-v-mcp:created=$(Get-Date -Format o);role=ephemeral"" -ComputerName localhost
 if ($autoStart) {{ Start-VM -Name $name -ComputerName localhost }}
 
 $vm = Get-VM -Name $name -ComputerName localhost
 $vm | Select-Object Id, Name, State, ProcessorCount, @{{N='MemoryMB';E={{$_.MemoryStartup/1MB}}}}, @{{N='UptimeSeconds';E={{$_.Uptime.TotalSeconds}}}} | ConvertTo-Json
 ";
 
-        // ── Execute the primary pipeline under the inbound CT ─────────────────
-        // Phase tracks where the failure occurred for the LF-D17 envelope.
-        // It is updated optimistically before each phase boundary; rollback uses
-        // the final value when reporting `details.phase`.
+        // Update phase before each boundary so rollback reports the failure location in details.phase.
         string phase = "create";
         Exception? primaryFailure = null;
         PowerShellResult? primaryResult = null;
@@ -416,18 +461,8 @@ $vm | Select-Object Id, Name, State, ProcessorCount, @{{N='MemoryMB';E={{$_.Memo
 
         if (primaryFailure is null && primaryResult is not null)
         {
-            // VC-D8 (Issue #169 Gate 6 remediation, ADR-4 / ST-D6): on the
-            // default path the post-create SHA-256 MUST be force-recomputed
-            // unconditionally — NOT gated on a stat-tuple "did it move?" check.
-            // The previous tupleMoved-gated branch defeated ST-D6 against
-            // preserved-stat mutations (Rows 1/4/5 of the §ADR-4 Threat Model:
-            // sparse in-place overwrite, touch -t mtime reset, silent
-            // storage-layer bit flip), because the cached pre-hash would also
-            // be re-served as the post-hash whenever the cheap stat tuple
-            // matched. Force-recompute via IBaseImageHashCache.ForceRecomputeAsync
-            // bypasses the stat-tuple short-circuit and re-reads the bytes from
-            // disk. The opt-out path (verifyBaseImageHash:false) skips this
-            // block entirely; mutation guard there is ReadOnly-attribute-only.
+            // Always re-read post-create bytes: unchanged stat tuples can hide sparse overwrites, reset mtimes or storage bit flips.
+            // Reusing the cached pre-hash would miss these mutations. Opting out leaves only the ReadOnly guard.
             try
             {
                 if (verifyBaseImageHash && preHash is not null && _baseImageHashCache is not null)
@@ -446,11 +481,8 @@ $vm | Select-Object Id, Name, State, ProcessorCount, @{{N='MemoryMB';E={{$_.Memo
                         new { postHashStageMs = __postHashSw.ElapsedMilliseconds, match = __match });
                     if (!__match)
                     {
-                        // VC-D15: record the mutation event before throwing so
-                        // the sidecar is deleted, the cache entry is evicted,
-                        // and vm_diag surfaces a `lastMutationDetected` entry.
-                        // Best-effort — any failure inside the cache helper is
-                        // swallowed there so the rollback envelope is preserved.
+                        // Record mutation before throwing to delete the sidecar, evict the cache entry and expose lastMutationDetected.
+                        // Recording is best-effort so failure cannot replace the rollback envelope.
                         try
                         {
                             _baseImageHashCache.RecordMutationDetected(
@@ -491,46 +523,81 @@ $vm | Select-Object Id, Name, State, ProcessorCount, @{{N='MemoryMB';E={{$_.Memo
 
         if (primaryFailure is null && primaryResult is not null)
         {
-            // Full success — return parsed VmInfo.
             _logger.LogDebug(
                 "vm_create stage {stage} elapsedMs={elapsedMs} vm={vmName}",
                 "success-parsing", __traceSw.ElapsedMilliseconds, name);
             var __parsed = ParseSingleVmInfo(primaryResult.Stdout ?? string.Empty, hostProfile.HostId);
-            _logger.LogDebug(
-                "vm_create stage {stage} elapsedMs={elapsedMs} vm={vmName}",
-                "envelope-returned", __traceSw.ElapsedMilliseconds, name);
-            return __parsed;
+
+            if (!passwordSupplied)
+            {
+                // The result must state whether a password was applied, including on the
+                // no-password path.
+                __parsed.PasswordApplied = false;
+                _logger.LogDebug(
+                    "vm_create stage {stage} elapsedMs={elapsedMs} vm={vmName}",
+                    "envelope-returned", __traceSw.ElapsedMilliseconds, name);
+                return __parsed;
+            }
+
+            // Seed before first boot: only this window lets the guest consume the offline answer file.
+            try
+            {
+                await _unattendSeeder
+                    .SeedAsync(diffPath, name, adminPassword!, locale: "en-US", ct)
+                    .ConfigureAwait(false);
+                await StartVmForPasswordSeedingAsync(escapedName, name, ct).ConfigureAwait(false);
+            }
+            catch (Exception seedEx)
+            {
+                // A failure to seed or start is a genuinely-failed create: fall through to the
+                // unchanged rollback.
+                primaryFailure = seedEx;
+
+                // Rollback is best-effort and may leave a residual VHDX behind. Seeding may already
+                // have written the answer file, so it is removed BEFORE rollback — otherwise this
+                // terminal outcome could leave a readable plaintext password artifact.
+                var scrubbedOnFailure =
+                    await StopThenScrubAsync(escapedName, name, diffPath).ConfigureAwait(false);
+                if (!scrubbedOnFailure)
+                {
+                    // A silently-dropped scrub failure would report a plain create failure while a
+                    // readable plaintext password artifact survives on disk; the caller must see it.
+                    _logger.LogError(
+                        "vm_create could not confirm removal of the administrator-password answer file for '{VmName}' after a failed seed/start.",
+                        name);
+                    primaryFailure = new InvalidOperationException(
+                        $"VM '{name}' could not be created, and the answer file carrying the administrator password could not be confirmed removed from its disk.",
+                        seedEx);
+                }
+            }
+
+            if (primaryFailure is null)
+            {
+                // The window starts here — the guest has just powered on for the first time.
+                await ConfirmLoginReadyAsync(
+                    name, escapedName, diffPath, adminPassword!, createTimeBudgetSeconds, callerCt)
+                    .ConfigureAwait(false);
+
+                __parsed.PasswordApplied = true;
+                __parsed.State = "Running";
+                _logger.LogDebug(
+                    "vm_create stage {stage} elapsedMs={elapsedMs} vm={vmName}",
+                    "envelope-returned", __traceSw.ElapsedMilliseconds, name);
+                return __parsed;
+            }
         }
         _logger.LogDebug(
             "vm_create stage {stage} elapsedMs={elapsedMs} vm={vmName} data={@phaseData}",
             "failure-path-entry", __traceSw.ElapsedMilliseconds, name,
             new { failureType = primaryFailure?.GetType().Name, failureMessage = primaryFailure?.Message });
 
-        // ── Issue #203 / VC-DUP-D3: per-artifact ownership inference ─────────
-        // The primary script is single-shot (probe → New-VHD → New-VM → Set-VM →
-        // optional Start-VM). We cannot directly observe which step failed, so
-        // ownership is inferred from PS stderr signals:
-        //   - "already exists" with no other progress signal ⇒ collision detected
-        //     at the script's internal Get-VM probe (residual race vs. our LF-D19
-        //     probe). Nothing was created → CreatedArtifacts is fully empty.
-        //   - "New-VM" / "Set-VM" / "Start-VM" mentioned in stderr ⇒ New-VHD must
-        //     have succeeded and the VHDX is owned. VmRegistered is true only when
-        //     the failure happened AFTER New-VM completed (Set-VM / Start-VM
-        //     phase).
-        // This is the LF-D18 / VC-DUP-D3 "did this call create it?" invariant:
-        // Remove-VM MUST NOT run unless created.VmRegistered == true.
+        // Infer ownership from stderr because the primary script is single-shot. A bare collision owns nothing;
+        // New-VM/Set-VM/Start-VM errors imply VHDX ownership, but only Set-VM/Start-VM imply completed registration.
+        // Never Remove-VM unless this call registered it.
         var isNameCollision = LooksLikeNameCollision(primaryFailure!, primaryResult);
 
-        // IA-Gate 6 fix (post-success host-side failure): distinguish the
-        // ambiguous branch in InferCreatedArtifacts by signalling whether the
-        // PowerShell primary script itself completed successfully (exit 0,
-        // not cancelled, not timed out, empty stderr) before a post-success
-        // host-side check (e.g., the BASE_IMAGE_MUTATED post-hash recompute,
-        // or any future host-side guard fired after the script returned) set
-        // primaryFailure. In that case New-VM / Set-VM / Start-VM all ran to
-        // completion ⇒ this invocation OWNS the VM registration, and the
-        // rollback MUST run Remove-VM. Pre-fix conservative behaviour kept
-        // VmRegistered=false and leaked the newly-registered VM.
+        // A successful primary script followed by a failed host-side guard still owns the VM registration.
+        // Rollback must remove it; treating this as an ambiguous script failure leaks the newly created VM.
         var primaryScriptSucceeded =
             primaryResult is not null
             && primaryResult.Success
@@ -542,13 +609,8 @@ $vm | Select-Object Id, Name, State, ProcessorCount, @{{N='MemoryMB';E={{$_.Memo
             primaryFailure!, primaryResult, diffPath, vmDir, isNameCollision,
             primaryScriptSucceeded);
 
-        // ── Issue #203 / VC-DUP-D4: residual-race name-collision branch ──────
-        // The script's internal Get-VM threw "already exists" — either a TOCTOU
-        // race vs. our LF-D19 probe, or parallel vm_create from another client.
-        // Map to VM_ALREADY_EXISTS (NOT COMMAND_FAILED) and clean up ONLY the
-        // owned VHDX. Remove-VM is gated off by created.VmRegistered == false,
-        // so the colliding VM (which belongs to a different invocation) is
-        // never touched.
+        // A collision after the initial probe may belong to another client. Return VM_ALREADY_EXISTS, not COMMAND_FAILED,
+        // and clean up only owned artifacts; never remove the colliding VM.
         if (isNameCollision)
         {
             _logger.LogDebug(
@@ -576,12 +638,11 @@ $vm | Select-Object Id, Name, State, ProcessorCount, @{{N='MemoryMB';E={{$_.Memo
             throw new VmAlreadyExistsException(hostProfile.HostId, name, primaryFailure!);
         }
 
-        // ── LF-D17: cancellation-safe, awaited rollback (non-collision path) ─
         phase = ClassifyPhase(primaryFailure!, primaryResult);
         var rollback = await RunCreateRollbackAsync(
             name, vmDir, diffPath, primaryFailure!, ct, created).ConfigureAwait(false);
 
-        // Original failure log AFTER rollback so the order in stderr matches LF-D17.
+        // Log the original failure after rollback to preserve diagnostic ordering.
         _logger.LogError(primaryFailure, "vm_create failed for {VmName}", name);
 
         var errorCode = primaryFailure switch
@@ -601,34 +662,141 @@ $vm | Select-Object Id, Name, State, ProcessorCount, @{{N='MemoryMB';E={{$_.Memo
     }
 
     /// <summary>
-    /// Issue #203 / VC-DUP-D1 / LF-D19: pre-create existence probe.
-    /// Runs <c>Get-VM -Name $name -ComputerName localhost</c> via the same
-    /// PowerShell executor used by the primary pipeline. A non-null result ⇒
-    /// the VM already exists on this host. Errors are treated as "absent" so
-    /// the probe never false-positives — an actual collision will surface again
-    /// inside the primary pipeline and be caught by the VC-DUP-D4 residual-race
-    /// branch with full owned-only rollback semantics.
+    /// starts the seeded VM. Separate from the primary create script because the
+    /// in-script <c>Start-VM</c> is suppressed on the password path — the answer file must be in
+    /// place before first boot.
     /// </summary>
+    private async Task StartVmForPasswordSeedingAsync(string escapedName, string name, CancellationToken ct)
+    {
+        var script = $@"
+$ErrorActionPreference = 'Stop'
+Import-Module Hyper-V -ErrorAction Stop
+Start-VM -Name '{escapedName}' -ComputerName localhost | Out-Null
+Write-Output 'STARTED'
+";
+        var result = await _psExecutor.ExecuteAsync(script, timeoutSeconds: 120, ct: ct).ConfigureAwait(false);
+        // Exact terminal-token match: a substring test reads 'NOT_STARTED' as 'STARTED' and would
+        // let a VM that never powered on proceed into the readiness poll.
+        if (!result.Success
+            || !string.Equals(
+                BaseImageGeneralizationProbe.LastNonEmptyLine(result.Stdout), "STARTED",
+                StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"vm_create could not start VM '{name}' after seeding the administrator password.");
+        }
+    }
+
+    /// <summary>
+    /// runs the bounded readiness poll and guarantees the guest-delivery artifact is
+    /// gone before ANY terminal outcome. On the preserve-on-failure path the VM is stopped first,
+    /// because an offline re-mount requires the VM to be Off, and only then is the file deleted.
+    /// </summary>
+    private async Task ConfirmLoginReadyAsync(
+        string name, string escapedName, string diffPath, string adminPassword,
+        int createTimeBudgetSeconds, CancellationToken ct)
+    {
+        var readinessLimitSeconds = Math.Max(MinimumReadinessLimitSeconds, createTimeBudgetSeconds);
+
+        // Fresh window measured from first power-on: the token handed in here is the caller's, not
+        // the pre-boot budget's, so none of the create work already done eats into it.
+        using var readinessCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        readinessCts.CancelAfter(TimeSpan.FromSeconds(readinessLimitSeconds + ReadinessCancellationGraceSeconds));
+
+        GuestReadinessOutcome outcome;
+        try
+        {
+            outcome = await _readinessPoller
+                .WaitForLoginReadyAsync(name, adminPassword, readinessLimitSeconds, readinessCts.Token)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Scrub before propagating cancellation so the plaintext answer file is not left in a running VM.
+            // Cancellation remains the outcome, but an unconfirmed scrub must be logged.
+            var scrubbedOnCancel = await StopThenScrubAsync(escapedName, name, diffPath).ConfigureAwait(false);
+            if (!scrubbedOnCancel)
+            {
+                _logger.LogError(
+                    "vm_create was cancelled for VM '{VmName}' and removal of the guest answer file from its disk could NOT be confirmed; the VM is preserved and the plaintext administrator password may still be readable inside it.",
+                    name);
+            }
+            throw;
+        }
+
+        if (outcome == GuestReadinessOutcome.LoginReadyAndScrubbed)
+        {
+            return;
+        }
+
+        // An unconfirmed scrub may leave the plaintext answer file readable, so it MUST NOT be
+        // reported as success even though the guest accepted the credential: the offline scrub
+        // below is the second chance, and the call still fails.
+        var scrubbed = await StopThenScrubAsync(escapedName, name, diffPath).ConfigureAwait(false);
+        var reason = outcome switch
+        {
+            GuestReadinessOutcome.CredentialRejected
+                => "the guest refused the supplied administrator password",
+            GuestReadinessOutcome.LoginReadyScrubUnconfirmed
+                => "removal of the answer file written into its disk could not be confirmed from inside the guest",
+            GuestReadinessOutcome.PollFailed
+                => "the readiness check could not be completed",
+            _ => "the guest did not become login-ready within the supported readiness limit",
+        };
+        var message = scrubbed
+            ? $"VM '{name}' was created but never confirmed login-ready because {reason}. The VM has been preserved and stopped so you can inspect or delete it."
+            : $"VM '{name}' was created but never confirmed login-ready because {reason}, and the answer file written into its disk could not be confirmed removed. The VM has been preserved so you can inspect or delete it.";
+
+        throw new ReadinessNotReachedException(name, message, scrubbed);
+    }
+
+    /// <summary>
+    /// Stops the preserved VM (offline mount requires VM Off), then deletes the answer file from
+    /// the differencing disk. Runs on <see cref="CancellationToken.None"/>: the scrub must still
+    /// happen when the caller's token is already signalled.
+    /// </summary>
+    private async Task<bool> StopThenScrubAsync(string escapedName, string name, string diffPath)
+    {
+        try
+        {
+            var stopScript = $@"
+$ErrorActionPreference = 'Continue'
+Import-Module Hyper-V -ErrorAction SilentlyContinue
+Stop-VM -Name '{escapedName}' -TurnOff -Force -ComputerName localhost -ErrorAction SilentlyContinue | Out-Null
+$vm = Get-VM -Name '{escapedName}' -ComputerName localhost -ErrorAction SilentlyContinue
+if ($vm -and $vm.State -eq 'Off') {{ Write-Output 'STOPPED' }} else {{ Write-Output 'NOT_STOPPED' }}
+";
+            var stopResult = await _psExecutor
+                .ExecuteAsync(stopScript, timeoutSeconds: 120, ct: CancellationToken.None)
+                .ConfigureAwait(false);
+            // Exact terminal-token match: a substring test reads 'NOT_STOPPED' as 'STOPPED' and
+            // would drive an offline mount against a still-running VM.
+            if (!string.Equals(
+                    BaseImageGeneralizationProbe.LastNonEmptyLine(stopResult.Stdout), "STOPPED",
+                    StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            return await _unattendSeeder.ScrubOfflineAsync(diffPath, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                "vm_create could not scrub the guest answer file for preserved VM '{VmName}': {ExType}",
+                name, ex.GetType().Name);
+            return false;
+        }
+    }
+
+    /// <summary>Read-only Get-VM existence probe through the primary executor; a non-null result means present.
+    /// Errors fail open to the primary pipeline, whose collision handling still limits rollback to owned artifacts.</summary>
     private async Task<bool> VmExistsOnHostAsync(string name, CancellationToken ct)
     {
         var escapedName = EscapePowerShellString(name);
-        // LF-D7: -ComputerName localhost avoids the Win11 26200+ WMI null-name bug.
-        // Probe is read-only; cancellation is observed under the inbound CT (no
-        // rollback to bypass — nothing has been created).
-        // IA-Gate 10 / Copilot review fix: probe now runs under
-        // $ErrorActionPreference='Stop' with an explicit Import-Module and a
-        // try/catch that maps cmdlet/module failures to a distinct
-        // 'inconclusive' sentinel. Previously the probe used SilentlyContinue
-        // + a swallowed Get-VM -ErrorAction SilentlyContinue and ALWAYS emitted
-        // 'present'/'absent', which meant a Hyper-V module load failure or PS
-        // host glitch silently printed 'absent' — bypassing the duplicate-name
-        // guard. The sentinel is intentionally distinct from the
-        // residue-probe's 'probe-failed:' marker so test-side script
-        // recognisers continue to identify this as the LF-D19 probe.
-        // Get-VM returns a non-terminating ItemNotFoundException when the VM
-        // is genuinely absent — we want that to surface as 'absent', NOT as
-        // an inconclusive error. The catch therefore only treats failures
-        // OTHER than ItemNotFoundException as inconclusive.
+        // -ComputerName localhost avoids the Win11 26200+ WMI null-name bug; caller cancellation applies before any artifacts exist.
+        // Stop-on-error and explicit import distinguish module/host failures (inconclusive) from ItemNotFoundException (absent).
+        // The sentinel differs from the residue probe's probe-failed marker so script recognizers can distinguish the probes.
         var probeScript = $@"
 $ErrorActionPreference = 'Stop'
 try {{
@@ -637,16 +805,8 @@ try {{
         $vm = Get-VM -Name '{escapedName}' -ComputerName localhost -ErrorAction Stop
         if ($vm) {{ 'present' }} else {{ 'absent' }}
     }} catch [Microsoft.HyperV.PowerShell.VirtualizationException] {{
-        # IA-Gate 6 fix: the typed Hyper-V exception catch is restricted to
-        # actual not-found outcomes. Previously this branch mapped EVERY
-        # VirtualizationException to 'absent', which silently swallowed
-        # service-unavailable / WMI / permission failures and bypassed the
-        # duplicate-name guard. We now inspect the same FullyQualifiedErrorId
-        # markers as the generic catch below and fall through to
-        # 'inconclusive' for anything that is not a recognised not-found
-        # category — the LF-D19 caller treats 'inconclusive' as fail-open into
-        # the primary pipeline + VC-DUP-D4 residual-race branch (defence-in-
-        # depth preserved without false-claiming 'absent').
+        # Only recognized not-found errors mean absent; service/WMI/permission failures remain inconclusive.
+        # The primary pipeline still handles collisions with owned-only rollback.
         if ($_.FullyQualifiedErrorId -match 'ItemNotFound|ObjectNotFound|VMNotFound') {{
             'absent'
         }} elseif ($_.CategoryInfo -and $_.CategoryInfo.Category -eq 'ObjectNotFound') {{
@@ -677,10 +837,7 @@ try {{
                 || string.IsNullOrWhiteSpace(stdout)
                 || stdout.Equals("inconclusive", StringComparison.OrdinalIgnoreCase))
             {
-                // Probe inconclusive (module load failure, PS host glitch,
-                // permissions, non-success exit). Fall through to the primary
-                // pipeline + VC-DUP-D4 residual-race branch — same defence-in-
-                // depth contract as before, just no longer claiming 'absent'.
+                // Inconclusive probes defer to the primary pipeline and owned-only collision rollback, without claiming absence.
                 _logger.LogDebug(
                     "vm_create LF-D19 probe inconclusive for '{VmName}'; falling through to primary pipeline. (exit={ExitCode}, stdout='{Stdout}')",
                     name, probe.ExitCode, stdout);
@@ -702,13 +859,7 @@ try {{
         }
     }
 
-    /// <summary>
-    /// Issue #203 / VC-DUP-D3 / LF-D18: per-invocation artifact ownership record.
-    /// Each field starts empty/false; the rollback path consults this record so
-    /// that <c>Remove-VM</c> is NEVER called against a VM this invocation did not
-    /// register (the data-loss-prevention invariant from the duplicate-name
-    /// component design).
-    /// </summary>
+    /// <summary>Ownership starts empty/false so rollback never removes a VM this call did not register.</summary>
     private sealed class CreatedArtifacts
     {
         /// <summary>Non-null when this call created the differencing VHDX at this path.</summary>
@@ -721,13 +872,7 @@ try {{
         public bool VmDirCreated { get; set; }
     }
 
-    /// <summary>
-    /// Issue #203 / VC-DUP-D4: returns true when the primary-pipeline failure
-    /// looks like a name collision surfaced by <c>New-VM</c> (or by the script's
-    /// own internal probe). Pattern derived from the design's "Name-Collision
-    /// Detection Rules": case-insensitive <c>already exists</c> substring match
-    /// against either stderr (preferred) or the exception message.
-    /// </summary>
+    /// <summary>Detects primary-pipeline name collisions case-insensitively, preferring stderr over the exception message.</summary>
     private static bool LooksLikeNameCollision(Exception failure, PowerShellResult? result)
     {
         if (failure is OperationCanceledException or TimeoutException)
@@ -741,24 +886,13 @@ try {{
         if (msg.Contains("BASE_IMAGE_MUTATED", StringComparison.Ordinal))
             return false;
 
-        // Issue #203 / IA-Gate 6 fix: require VM-specific co-occurrence with
-        // "already exists" to keep classification consistent with
-        // ErrorMapper.IsNameCollisionMessage. Generic "already exists" text
-        // (e.g. ImageCopyFailedException's "Destination image file already
-        // exists at '<path>'.") MUST NOT be misclassified as a VM-name
-        // collision — that path is COMMAND_FAILED with full LF-D17 rollback,
-        // not VM_ALREADY_EXISTS with owned-only cleanup.
+        // Require a VM-specific token with "already exists", matching ErrorMapper.IsNameCollisionMessage.
+        // A generic file collision must remain COMMAND_FAILED with full rollback, not VM_ALREADY_EXISTS with owned-only cleanup.
         return HasVmAlreadyExistsSignal(stderr) || HasVmAlreadyExistsSignal(msg);
     }
 
-    /// <summary>
-    /// Issue #203 / IA-Gate 6: returns true when <paramref name="text"/> contains
-    /// "already exists" co-occurring with a VM-specific token (<c>VM with name</c>,
-    /// <c>Get-VM</c>, or <c>New-VM</c>). Mirrors
-    /// <see cref="ErrorMapper.IsNameCollisionMessage(string?)"/> so the rollback
-    /// classification path and the wire-envelope mapping path agree on what
-    /// counts as a VM name collision.
-    /// </summary>
+    /// <summary>Matches "already exists" with VM with name, Get-VM or New-VM, as ErrorMapper does,
+    /// so rollback and wire-envelope classification agree.</summary>
     private static bool HasVmAlreadyExistsSignal(string? text)
     {
         if (string.IsNullOrEmpty(text))
@@ -770,15 +904,8 @@ try {{
             || text.Contains("New-VM", StringComparison.OrdinalIgnoreCase);
     }
 
-    /// <summary>
-    /// Issue #203 / VC-DUP-D3: infers which artifacts the current invocation
-    /// actually created from the primary-pipeline failure signals. Conservative
-    /// by design — when stderr/message signals are ambiguous, the result
-    /// preserves the prior LF-D17 behaviour (full rollback consideration) by
-    /// marking the post-New-VHD/New-VM artifacts as owned. The duplicate-name
-    /// path is the only one where we MUST be tight: a script-internal probe
-    /// throw produces an empty CreatedArtifacts so <c>Remove-VM</c> stays gated.
-    /// </summary>
+    /// <summary>Infers owned artifacts from failure signals. Ambiguous non-collision failures retain rollback consideration;
+    /// an internal pre-mutation collision probe owns nothing, so Remove-VM stays gated.</summary>
     private static CreatedArtifacts InferCreatedArtifacts(
         Exception failure,
         PowerShellResult? result,
@@ -790,26 +917,9 @@ try {{
         var created = new CreatedArtifacts();
         var stderr = result?.Stderr ?? string.Empty;
 
-        // VC-DUP-D3 / LF-D18 / IA-Gate 6 fix: name-collision classification has
-        // THREE sub-cases that must be distinguished — they have different
-        // ownership profiles:
-        //
-        //   1. Pre-mutator path (LF-D19 probe hit): handled upstream — never
-        //      reaches this method.
-        //   2. Script-internal pre-mutator probe (in-script Get-VM check before
-        //      New-VHD throws "already exists"): owns NOTHING. Empty record so
-        //      the rollback is a no-op for the colliding VM and its disks.
-        //   3. Post-New-VHD New-VM collision (residual race where the script's
-        //      probe missed the racer but New-VM itself collided): New-VHD
-        //      already succeeded, so this call OWNS the differencing VHDX and
-        //      the per-VM directory. The colliding VM registration belongs to
-        //      a different invocation, so VmRegistered stays false (Remove-VM
-        //      is gated off; data-loss invariant from VC-DUP-D3 / LF-D18).
-        //
-        // Disambiguation: PowerShell error records for the New-VM cmdlet carry
-        // the literal "New-VM" token in stderr (CategoryInfo / FullyQualifiedErrorId
-        // include the cmdlet name). The script's internal Get-VM probe throws a
-        // bare "VM with name '...' already exists" with no New-VM mention.
+        // The initial probe returns upstream; an internal Get-VM collision owns nothing.
+        // A New-VM collision owns the already-created VHDX and directory, never the foreign VM registration.
+        // Cmdlet error records include New-VM; the internal probe's bare collision message does not.
         if (isNameCollision)
         {
             if (stderr.Contains("New-VM", StringComparison.OrdinalIgnoreCase))
@@ -848,51 +958,26 @@ try {{
         }
         else if (primaryScriptSucceeded)
         {
-            // IA-Gate 6 fix (Case 2): the primary PowerShell script ran to
-            // completion (exit 0, not cancelled, not timed out, no stderr) —
-            // which means New-VHD, New-VM, Set-VM, and (optionally) Start-VM
-            // all succeeded — and a SUBSEQUENT host-side post-success check
-            // then threw, setting primaryFailure. The classic example is the
-            // BASE_IMAGE_MUTATED guard that runs after the primary script
-            // returns and re-hashes the base VHDX (lines ~371-433 of this
-            // file). Any future host-side post-success guard funnels here too.
-            //
-            // In this case THIS invocation registered the VM. Ownership is
-            // therefore full: VHDX + per-VM dir + VM registration. The
-            // rollback MUST run Remove-VM or the newly-created VM leaks
-            // (originally reported as the IA-Gate 6 regression on PR #210).
+            // The primary script succeeded before a host-side guard failed, so this call owns the VM, VHDX and directory.
+            // Rollback must Remove-VM or the newly registered VM leaks.
             created.VhdxPath = diffPath;
             created.VmDirCreated = true;
             created.VmRegistered = true;
         }
         else if (result is not null)
         {
-            // IA-Gate 6 fix (Case 1): the primary script reported failure
-            // (non-success exit, cancellation, timeout, or non-empty stderr
-            // without a recognised cmdlet token) and the classifier could not
-            // pinpoint a phase. We keep the conservative ownership profile —
-            // VHDX + dir only, VmRegistered=false — because the script's own
-            // failure means we cannot safely assume New-VM completed, and an
-            // over-aggressive Remove-VM here could destroy a foreign VM that
-            // happens to share the name (data-loss invariant from VC-DUP-D3 /
-            // LF-D18). The residue probe inside the rollback script still
-            // emits a vm:<name> residual entry when a foreign VM with the
-            // same name is detected, so operators are not silently denied
-            // diagnostic signal.
+            // An ambiguous script failure proves no completed registration: retain VHDX/directory cleanup but never remove a possibly foreign VM.
+            // The residue probe still reports a same-name VM so operators retain diagnostic signal.
             created.VhdxPath = diffPath;
             created.VmDirCreated = true;
         }
-        // else (Case 3): result is null ⇒ no primary execution was observed
-        // (the executor itself threw before the script ran, or before a
-        // result was assigned). Nothing to clean up. Empty CreatedArtifacts
-        // means RunCreateRollbackAsync sees no owned artifacts and the
-        // rollback is a no-op / file-only scan.
+        // No result means no primary execution was observed; empty ownership leaves only a no-op/file scan.
 
         return created;
     }
 
     /// <summary>
-    /// LF-D17 (b)(c)(d): runs the rollback PowerShell script under a fresh, detached
+    /// (b)(c)(d): runs the rollback PowerShell script under a fresh, detached
     /// <see cref="CancellationTokenSource"/> so a cancelled inbound CT cannot abort
     /// it. The task is <c>await</c>ed before the error response is returned.
     /// </summary>
@@ -907,10 +992,7 @@ try {{
         var budgetSeconds = ResolveRollbackBudgetSeconds();
         var budget = TimeSpan.FromSeconds(budgetSeconds);
 
-        // Issue #203 / VC-DUP-D3 / LF-D18: ownership defaults to "this call owns
-        // everything" when no record was supplied — preserves the LF-D17
-        // pre-#203 behaviour for legacy call sites (none exist now, but the
-        // contract is defense-in-depth).
+        // Missing ownership records retain legacy full ownership for backward compatibility.
         var ownsVm = created?.VmRegistered ?? true;
         var ownsVhdx = created?.VhdxPath is not null || created is null;
         var ownsVmDir = created?.VmDirCreated ?? true;
@@ -923,18 +1005,13 @@ try {{
         var escapedVmDir = EscapePowerShellString(vmDir);
         var escapedDiffPath = EscapePowerShellString(diffPath);
 
-        // VC-DUP-D3 / LF-D18: Remove-VM (and VHDX/dir removal) are gated by the
-        // ownership flags so the rollback NEVER touches an artifact this call did
-        // not create. The pre-existing VM in the duplicate-name path is preserved
-        // because ownsVm is $false ⇒ the Remove-VM block is skipped entirely.
+        // Gate cleanup by ownership so rollback never deletes another call's VM or files.
         var psOwnsVm = ownsVm ? "$true" : "$false";
         var psOwnsVhdx = ownsVhdx ? "$true" : "$false";
         var psOwnsVmDir = ownsVmDir ? "$true" : "$false";
 
-        // LF-D17 (d): idempotent, standalone rollback script. Every step is
-        // SilentlyContinue + Test-Path-guarded; safe to run when nothing was created.
-        // Output: a single JSON line listing the kinds successfully removed and any
-        // residual artifacts still present at completion.
+        // Rollback is idempotent: SilentlyContinue and Test-Path guards tolerate absent artifacts.
+        // Its JSON reports removed kinds and remaining artifacts.
         var rollbackScript = $@"
 $ErrorActionPreference = 'SilentlyContinue'
 $name = '{escapedName}'
@@ -998,10 +1075,7 @@ if ($ownsVmDir -and (Test-Path -LiteralPath $vmDir)) {{
 }}
 
 $residual = New-Object System.Collections.ArrayList
-# VC-DUP-D3 / LF-D18: only report artifacts as residual if THIS call owned them.
-# A pre-existing VHDX/dir/VM left by a prior successful call is NOT this call's
-# residue — reporting it would mislead operators into thinking the rollback
-# failed.
+# Report only this call's owned artifacts as residue; pre-existing files or VMs do not mean rollback failed.
 if ($ownsVhdx -and (Test-Path -LiteralPath $diffPath)) {{ $residual.Add($diffPath) | Out-Null }}
 if ($ownsVmDir -and (Test-Path -LiteralPath $vmDir))    {{ $residual.Add($vmDir)    | Out-Null }}
 $stillRegistered = if ($ownsVm) {{ Get-VM -Name $name -ComputerName localhost -ErrorAction SilentlyContinue }} else {{ $null }}
@@ -1015,7 +1089,7 @@ if ($stillRegistered) {{ $residual.Add(""vm:$name"") | Out-Null }}
 ";
 
         var sw = Stopwatch.StartNew();
-        // LF-D17 (b): fresh CTS, NOT linked to inbound CT.
+        // (b): fresh CTS, NOT linked to inbound CT.
         using var rollbackCts = new CancellationTokenSource(budget);
         PowerShellResult? rollbackResult = null;
         Exception? rollbackError = null;
@@ -1081,7 +1155,7 @@ if ($stillRegistered) {{ $residual.Add(""vm:$name"") | Out-Null }}
             catch (Exception parseEx)
             {
                 _logger.LogWarning(parseEx, "vm_create rollback output was not parseable JSON; treating as residual.");
-                // VC-DUP-D3: only treat artifacts as residual when this call owned
+                // only treat artifacts as residual when this call owned
                 // them. Pre-existing-VM artifacts are not this call's residue.
                 if (ownsVhdx) residualArtifacts.Add(diffPath);
                 if (ownsVmDir) residualArtifacts.Add(vmDir);
@@ -1096,11 +1170,8 @@ if ($stillRegistered) {{ $residual.Add(""vm:$name"") | Out-Null }}
                 name, diffPath, vmDir, sw.ElapsedMilliseconds, (long)budget.TotalMilliseconds);
             if (ownsVhdx) residualArtifacts.Add(diffPath);
             if (ownsVmDir) residualArtifacts.Add(vmDir);
-            // 🟡 #3: budget-exceeded fallback omits registered-VM residue. Try a
-            // defensive Get-VM under the inbound CT only (rollback CTS is dead).
-            // VC-DUP-D3: only probe when this call owned the VM registration —
-            // otherwise the colliding VM (owned by someone else) would surface
-            // as residue and mislead operators.
+            // After rollback budget expiry, probe owned VM registration under the caller token.
+            // Never report a foreign colliding VM as this call's residue.
             if (ownsVm)
             {
                 await TryAppendRegisteredVmResidueAsync(name, residualArtifacts, inboundCt).ConfigureAwait(false);
@@ -1114,29 +1185,18 @@ if ($stillRegistered) {{ $residual.Add(""vm:$name"") | Out-Null }}
                 "vm_create rollback PowerShell failed for {VmName}: stderr={Stderr}",
                 name, rollbackResult?.Stderr);
             // Best-effort: assume the worst until proven otherwise via filesystem probe below.
-            // VC-DUP-D3: gate on ownership — never report someone else's VHDX/dir.
+            // gate on ownership — never report someone else's VHDX/dir.
             if (ownsVhdx && File.Exists(diffPath)) residualArtifacts.Add(diffPath);
             if (ownsVmDir && Directory.Exists(vmDir)) residualArtifacts.Add(vmDir);
-            // 🟡 #3: rollback-PowerShell-failure fallback omits registered-VM
-            // residue. Try a defensive Get-VM under the inbound CT only.
-            // VC-DUP-D3: only when this call owned the VM registration.
+            // After rollback PowerShell failure, probe owned VM registration under the caller token.
             if (ownsVm)
             {
                 await TryAppendRegisteredVmResidueAsync(name, residualArtifacts, inboundCt).ConfigureAwait(false);
             }
         }
 
-        // Defensive filesystem cross-check: even if the script reported success,
-        // confirm via the host-side filesystem (this is the same probe tests use
-        // for AC#2). If the PS-reported and host-observed views disagree, prefer
-        // the host-observed view so the envelope is authoritative.
-        // 🟡 #2 (LF-D17 envelope completeness): cross-check BOTH the differencing
-        // VHDX path AND the per-VM directory. The directory can survive a partial
-        // rollback (e.g. extra files dropped by Hyper-V) even when the diff VHDX
-        // was removed.
-        // VC-DUP-D3 / LF-D18: only flag as residual when this call owned the
-        // artifact. Pre-existing files left by a prior successful invocation
-        // are NOT this call's residue and must not be reported as such.
+        // Prefer host-observed residue over PowerShell's report. Check both owned VHDX and directory:
+        // extra Hyper-V files can leave the directory after disk removal. Never report another call's files as residue.
         if (ownsVhdx && File.Exists(diffPath) && !residualArtifacts.Contains(diffPath))
         {
             residualArtifacts.Add(diffPath);
@@ -1163,12 +1223,9 @@ if ($stillRegistered) {{ $residual.Add(""vm:$name"") | Out-Null }}
         return info;
     }
 
-    /// <summary>
-    /// Classifies the LF-D17 phase enum (<c>create</c> | <c>register</c> |
-    /// <c>configure</c>) from the failure / result pair. The current pipeline is
-    /// single-script so phase boundaries are inferred from stderr signals; this
-    /// keeps the contract honest without false precision.
-    /// </summary>
+    /// <summary> Classifies the phase enum (<c>create</c> | <c>register</c> | <c>configure</c>) from the failure /
+    /// result pair. The current pipeline is single-script so phase boundaries are inferred from stderr signals; this
+    /// keeps the contract honest without false precision. </summary>
     private static string ClassifyPhase(Exception failure, PowerShellResult? result)
     {
         var text = (result?.Stderr ?? string.Empty) + " " + (failure?.Message ?? string.Empty);
@@ -1207,50 +1264,18 @@ if ($stillRegistered) {{ $residual.Add(""vm:$name"") | Out-Null }}
         return DefaultRollbackBudgetSeconds;
     }
 
-    // VC-D8 (Issue #169 Gate 6): the prior local ForceRecomputeAsync helper
-    // (which simply re-called cache.GetOrComputeAsync after a stat-tuple-moved
-    // gate) was removed. It is replaced by IBaseImageHashCache.ForceRecomputeAsync
-    // which unconditionally bypasses the stat short-circuit and re-reads bytes
-    // from disk — necessary to detect preserved-stat mutations on the default
-    // verifyBaseImageHash:true path. See VC-D8 / §ADR-4 Threat Model.
 
-    /// <summary>
-    /// Eagerly-snapshotted file metadata used by the ST-D6a mutation guard.
-    /// Holding the raw <see cref="FileInfo"/> would be unsafe: its properties are
-    /// resolved lazily and cached on first read, so a captured pre-create
-    /// <c>FileInfo</c> would read POST-create state when compared, silently
-    /// masking real mutation. This struct stores the primitives directly.
-    /// </summary>
+    /// <summary>Snapshot metadata primitives eagerly: lazy FileInfo reads could capture post-create state
+    /// for the pre-create snapshot and hide mutation.</summary>
     private readonly record struct FileStatSnapshot(
         long Length,
         DateTime LastWriteTimeUtc,
         bool IsReadOnly);
 
-    /// <summary>
-    /// 🟡 #3 (LF-D17 envelope completeness): defensive host-side cross-check that
-    /// the VM is no longer registered after a fallback rollback path. Runs under
-    /// the inbound CT only — the rollback budget CTS is already cancelled here,
-    /// so we cannot reuse it.
-    ///
-    /// FAIL-CLOSED CONTRACT (post-#164 review fix):
-    /// The probe distinguishes three outcomes — <c>present</c>, <c>absent</c>,
-    /// and <c>probe-failed:&lt;reason&gt;</c>. The PowerShell snippet uses
-    /// <c>$ErrorActionPreference='Stop'</c> inside a <c>try { ... } catch { ... }</c>
-    /// so any module-import failure, non-terminating cmdlet error, or other
-    /// PowerShell-side problem surfaces as <c>probe-failed:&lt;reason&gt;</c>
-    /// rather than silently falling through to a misleading <c>absent</c>.
-    ///
-    /// Host-side mapping:
-    /// <list type="bullet">
-    /// <item><description><c>present</c> ⇒ append <c>vm:&lt;vmName&gt;</c>.</description></item>
-    /// <item><description><c>absent</c> ⇒ append nothing (authoritative no-residue).</description></item>
-    /// <item><description>Any other outcome (executor failure, timeout, cancellation,
-    /// <c>probe-failed:*</c>, unparseable stdout) ⇒ append the sentinel
-    /// <c>vm:&lt;vmName&gt;(probe-unknown)</c> and emit a Warning. We
-    /// conservatively assume the VM MIGHT still be registered rather than
-    /// silently asserting it isn't.</description></item>
-    /// </list>
-    /// </summary>
+    /// <summary>Cross-checks registration after fallback rollback using the caller token; the rollback token has expired.
+    /// Stop-on-error distinguishes present, absent and probe-failed:<reason> rather than treating failures as absence.
+    /// Present adds vm:<vmName>; absent adds nothing. Failure, timeout, cancellation or unparseable output adds
+    /// vm:<vmName>(probe-unknown) and a warning because registration may remain.</summary>
     private async Task TryAppendRegisteredVmResidueAsync(
         string vmName,
         List<string> residualArtifacts,
@@ -1266,19 +1291,8 @@ if ($stillRegistered) {{ $residual.Add(""vm:$name"") | Out-Null }}
         }
 
         var escapedName = EscapePowerShellString(vmName);
-        // Strict error handling: any failure inside the try block (module import,
-        // Get-VM non-terminating error promoted by ErrorActionPreference='Stop',
-        // etc.) is caught and surfaced as 'probe-failed:<reason>' so the host
-        // can treat it as fail-closed rather than as 'absent'.
-        // Fail-closed probe: the script-level Stop preference governs error
-        // handling. Get-VM is invoked WITHOUT any per-call suppression (no
-        // -ErrorAction SilentlyContinue/Ignore, no 2>$null redirect) so any
-        // non-terminating error is promoted to a terminating exception. We
-        // then distinguish the specific "VM not registered" outcome (message
-        // matches /not\s*found/) — which maps to 'absent' — from every other
-        // failure mode (module load, RPC, permissions, etc.) which maps to
-        // 'probe-failed:<reason>' so the host appends the probe-unknown
-        // sentinel instead of silently asserting no residue.
+        // Do not suppress Get-VM errors: Stop promotes non-terminating failures into the catch.
+        // Only not-found means absent; module/RPC/permission failures yield probe-failed so the caller reports unknown residue.
         var probeScript = $@"
 $ErrorActionPreference = 'Stop'
 try {{
@@ -1362,22 +1376,9 @@ try {{
         }
     }
 
-    /// <summary>
-    /// PB-D1 / PB-D3: Shared PowerShell skeleton for the seven VM lifecycle methods
-    /// (Start/Stop/Restart/Pause/Resume/Configure/GetVmStatus). Builds the standard
-    /// <c>Get-VM</c> precondition + per-method <paramref name="actionBlock"/> +
-    /// <see cref="VmInfoProjection"/> + <c>ConvertTo-Json</c> script and executes it.
-    /// </summary>
-    /// <remarks>
-    /// Host resolution and error mapping stay in the caller per PB-D5; this helper
-    /// returns the raw <see cref="PowerShellResult"/> so the caller can invoke
-    /// <c>HandleError</c> and <c>ParseSingleVmInfo</c> with its existing
-    /// <c>hostProfile</c>. The <paramref name="safeVmId"/> argument MUST already have
-    /// been validated by <see cref="InputValidation.ValidateVmId(string)"/>.
-    /// The <paramref name="actionBlock"/> sentinel for "no action" is the empty
-    /// string (used by <c>GetVmStatusAsync</c> per PB-D7.g), which produces exactly
-    /// one extra blank line in the emitted script — a PowerShell no-op (PB-I8).
-    /// </remarks>
+    /// <summary>Shared Get-VM/action/projection/JSON script for Start/Stop/Restart/Pause/Resume/Configure/GetVmStatus.
+    /// Callers retain host resolution, error mapping and parsing. safeVmId must already pass InputValidation.ValidateVmId.
+    /// An empty actionBlock is the read-only status sentinel and emits one harmless blank line.</summary>
     private async Task<PowerShellResult> RunSingleVmActionAsync(
         string safeVmId,
         string actionBlock,
@@ -1387,7 +1388,7 @@ try {{
         var script = $@"
 $ErrorActionPreference = 'Stop'
 Import-Module Hyper-V -ErrorAction Stop
-# WMI workaround (LF-D7): -ComputerName localhost avoids null-name WMI bug
+# WMI workaround : -ComputerName localhost avoids null-name WMI bug
 $vm = Get-VM -Id '{safeVmId}' -ComputerName localhost
 if (-not $vm) {{ throw ""VM not found: {safeVmId}"" }}
 {actionBlock}
@@ -1402,12 +1403,11 @@ $vm | {VmInfoProjection} | ConvertTo-Json
     {
         var hostProfile = ResolveLocalHost(hostId);
 
-        // Issue 2: Validate vmId is a GUID to prevent PowerShell injection.
+        // Validate vmId is a GUID to prevent PowerShell injection.
         var safeVmId = InputValidation.ValidateVmId(vmId);
 
         var actionBlock = $@"if ($vm.State -ne 'Running') {{
     Start-VM -VM $vm
-    # Re-fetch to get updated state
     $vm = Get-VM -Id '{safeVmId}' -ComputerName localhost
 }}";
 
@@ -1429,10 +1429,10 @@ $vm | {VmInfoProjection} | ConvertTo-Json
     {
         var hostProfile = ResolveLocalHost(hostId);
 
-        // Issue 2: Validate vmId is a GUID to prevent PowerShell injection.
+        // Validate vmId is a GUID to prevent PowerShell injection.
         var safeVmId = InputValidation.ValidateVmId(vmId);
 
-        // LF-D3: force=true uses -TurnOff for hard power-off.
+        // force=true uses -TurnOff for hard power-off.
         // force=false uses -Force to suppress confirmation but still attempts graceful shutdown.
         var stopCommand = force
             ? "$vm | Stop-VM -TurnOff -Force"
@@ -1440,7 +1440,6 @@ $vm | {VmInfoProjection} | ConvertTo-Json
 
         var actionBlock = $@"if ($vm.State -ne 'Off') {{
     {stopCommand}
-    # Re-fetch to get updated state
     $vm = Get-VM -Id '{safeVmId}' -ComputerName localhost
 }}";
 
@@ -1461,15 +1460,14 @@ $vm | {VmInfoProjection} | ConvertTo-Json
     {
         var hostProfile = ResolveLocalHost(hostId);
 
-        // Issue 2: Validate vmId is a GUID to prevent PowerShell injection.
+        // Validate vmId is a GUID to prevent PowerShell injection.
         var safeVmId = InputValidation.ValidateVmId(vmId);
 
-        // PB-Q1: The mid-action Get-VM inside Start-VM -VM (...) plus the trailing
+        // The mid-action Get-VM inside Start-VM -VM (...) plus the trailing
         // re-fetch is a deliberate double-fetch quirk preserved byte-for-byte.
         var actionBlock = $@"# Stop (graceful, no confirmation prompt) then start
 $vm | Stop-VM -Force
 Start-VM -VM (Get-VM -Id '{safeVmId}' -ComputerName localhost)
-# Re-fetch to get updated state
 $vm = Get-VM -Id '{safeVmId}' -ComputerName localhost";
 
         _logger.LogInformation("Restarting VM '{VmId}' on host '{HostId}'", safeVmId, hostId);
@@ -1480,31 +1478,134 @@ $vm = Get-VM -Id '{safeVmId}' -ComputerName localhost";
         return ParseSingleVmInfo(result.Stdout, hostProfile.HostId);
     }
 
-    /// <inheritdoc />
-    /// <remarks>
-    /// Pauses a running VM using Suspend-VM. The VM must be in Running state.
-    /// Returns updated VM info showing Paused state.
-    /// </remarks>
+    /// <inheritdoc /> <remarks> Pauses a running VM into in-memory <c>Paused</c> (State 6). The VM must be in Running
+    /// state. Returns updated VM info showing Paused state; a settle that reaches only Saved/Off, or times out, is
+    /// surfaced as a caller-facing failure (never a success projection). </remarks>
     public async Task<VmInfo> PauseVmAsync(string hostId, string vmId, CancellationToken ct = default)
     {
         var hostProfile = ResolveLocalHost(hostId);
 
-        // Issue 2: Validate vmId is a GUID to prevent PowerShell injection.
+        // Validate vmId is a GUID to prevent PowerShell injection.
         var safeVmId = InputValidation.ValidateVmId(vmId);
 
-        // The state-gate throw literal is byte-preserved — ErrorMapper substring-matches it
-        // upstream to produce INVALID_PARAMETER (Issue #126).
+        // Keep the state-gate throw literal stable for error mapping (currently COMMAND_FAILED).
+        // Pause uses RequestedState 9 from the parameter ValueMap, not return-value 32776 (rejected with 32775).
+        // Settle on Get-VM.State only; CIM EnabledState is a different enum.
         var actionBlock = $@"if ($vm.State -ne 'Running') {{ throw ""Cannot pause VM in state '$($vm.State)'. VM must be Running to pause."" }}
-Suspend-VM -VM $vm
-# Re-fetch to get updated state
-$vm = Get-VM -Id '{safeVmId}' -ComputerName localhost";
+$computerSystem = Get-CimInstance -Namespace root/virtualization/v2 -ClassName Msvm_ComputerSystem -Filter ""Name = '$($vm.Id)'""
+$pauseReturn = Invoke-CimMethod -InputObject $computerSystem -MethodName RequestStateChange -Arguments @{{ RequestedState = [uint16]9 }}
+if ($pauseReturn.ReturnValue -ne 0 -and $pauseReturn.ReturnValue -ne 4096) {{
+    # Only codes confirmed from the concrete Msvm_ComputerSystem.RequestStateChange return ValueMap;
+    # base-class CIM_EnabledLogicalElement codes are deliberately absent (decoding them would repeat
+    # the ValueMap conflation that caused #291). Exact numeric lookup, never substring.
+    $pauseReturnMeanings = @{{ 32775 = 'Invalid State Transition'; 32776 = 'Use of Timeout Parameter Not Supported' }}
+    $pauseReturnCode = [int]$pauseReturn.ReturnValue
+    $pauseReturnMeaning = $pauseReturnMeanings[$pauseReturnCode]
+    if ($null -eq $pauseReturnMeaning) {{ $pauseReturnMeaning = 'Unrecognized return code' }}
+    # Re-read before naming a state: during a concurrent shutdown the pre-request reading is
+    # 'Running', the one state that implies nothing is wrong.
+    $vm = Get-VM -Id '{safeVmId}' -ComputerName localhost
+    throw ""vm_pause RequestStateChange(9 = Quiesce) returned $pauseReturnCode ($pauseReturnMeaning); observed Get-VM state '$($vm.State)'.""
+}}
+# Conservative default so any unmodelled loop exit reports 'outcome unknown' rather than falsely
+# asserting a conflict.
+$pauseOutcome = '{PauseOutcomes.WaitExhausted}'
+$settleDeadline = (Get-Date).AddSeconds(10)
+while ((Get-Date) -lt $settleDeadline) {{
+    # WMI workaround : -ComputerName localhost avoids null-name WMI bug
+    $vm = Get-VM -Id '{safeVmId}' -ComputerName localhost
+    # Exact equality so 'Paused' never matches 'PausedCritical'.
+    if ($vm.State -eq 'Paused') {{ $pauseOutcome = '{PauseOutcomes.SettledPaused}'; break }}
+    # 'Saved' / 'Off' are failure terminals; transient 'Saving' / 'Pausing' keep polling.
+    if ($vm.State -eq 'Saved' -or $vm.State -eq 'Off') {{ $pauseOutcome = '{PauseOutcomes.ConflictingTerminalState}'; break }}
+    Start-Sleep -Milliseconds 250
+}}
+$vm = Get-VM -Id '{safeVmId}' -ComputerName localhost
+# The recorded exit reason classifies, never this state token: an exhausted wait and a genuine
+# divergence were both observed live ending on 'Saved'. This read supplies the reported state only.
+if ($pauseOutcome -eq '{PauseOutcomes.ConflictingTerminalState}') {{
+    throw ""{PauseOutcomes.SentinelPrefix}{PauseOutcomes.ConflictingTerminalState} the VM reached a terminal state other than 'Paused'; observed state '$($vm.State)'. The pause cannot succeed as issued.""
+}}
+if ($pauseOutcome -ne '{PauseOutcomes.SettledPaused}') {{
+    throw ""{PauseOutcomes.SentinelPrefix}{PauseOutcomes.WaitExhausted} the bounded wait elapsed without the VM settling; state observed when the wait was abandoned was '$($vm.State)'.""
+}}
+if ($vm.State -ne 'Paused') {{ throw ""vm_pause did not settle into 'Paused'; observed state '$($vm.State)'."" }}";
 
         _logger.LogInformation("Pausing VM '{VmId}' on host '{HostId}'", safeVmId, hostId);
 
         var result = await RunSingleVmActionAsync(safeVmId, actionBlock, timeoutSeconds: 120, ct: ct);
-        HandleError(result, hostProfile.HostId, safeVmId);
+        try
+        {
+            HandleError(result, hostProfile.HostId, safeVmId);
+        }
+        catch (InvalidOperationException ex)
+        {
+            var classified = ClassifyPauseFailure(ex);
+            // Unclassified failures rethrow in place: `throw ex` would reset the stack trace of
+            // exactly the unexpected pause failures that most need it.
+            if (ReferenceEquals(classified, ex))
+            {
+                throw;
+            }
 
-        return ParseSingleVmInfo(result.Stdout, hostProfile.HostId);
+            throw classified;
+        }
+
+        var pausedInfo = ParseSingleVmInfo(result.Stdout, hostProfile.HostId);
+
+        // The in-script throw fires only on a real host, so a mocked executor returning a
+        // non-Paused payload would otherwise leak a benign success.
+        if (!string.Equals(pausedInfo.State, "Paused", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"vm_pause did not settle into 'Paused'; observed state '{pausedInfo.State}'.");
+        }
+
+        return pausedInfo;
+    }
+
+    /// <summary>Recognized settle sentinels become VmStateConflictException; absent or unknown tokens leave the exception unchanged.
+    /// Search beyond the prefix: HandleError's preamble, PowerShell decoration and stderr may precede the sentinel.</summary>
+    private static Exception ClassifyPauseFailure(InvalidOperationException failure)
+    {
+        var message = failure.Message ?? string.Empty;
+        var sentinelIndex = message.IndexOf(PauseOutcomes.SentinelPrefix, StringComparison.Ordinal);
+        if (sentinelIndex < 0)
+        {
+            return failure;
+        }
+
+        var tokenStart = sentinelIndex + PauseOutcomes.SentinelPrefix.Length;
+        var outcome = message.Length > tokenStart
+            ? new string(message.Skip(tokenStart).TakeWhile(character => character == '_' || char.IsLetter(character)).ToArray())
+            : string.Empty;
+
+        if (outcome != PauseOutcomes.ConflictingTerminalState && outcome != PauseOutcomes.WaitExhausted)
+        {
+            return failure;
+        }
+
+        return new VmStateConflictException(outcome, ExtractObservedState(message), message);
+    }
+
+    /// <summary>
+    /// Lifts the single-quoted state token from the settle throw. Reads the LAST quoted token
+    /// because surrounding failure text may quote earlier values.
+    /// </summary>
+    private static string ExtractObservedState(string message)
+    {
+        var closingQuote = message.LastIndexOf('\'');
+        if (closingQuote <= 0)
+        {
+            return "Unknown";
+        }
+        var openingQuote = message.LastIndexOf('\'', closingQuote - 1);
+        if (openingQuote < 0)
+        {
+            return "Unknown";
+        }
+        var token = message.Substring(openingQuote + 1, closingQuote - openingQuote - 1).Trim();
+        return token.Length == 0 ? "Unknown" : token;
     }
 
     /// <inheritdoc />
@@ -1516,14 +1617,21 @@ $vm = Get-VM -Id '{safeVmId}' -ComputerName localhost";
     {
         var hostProfile = ResolveLocalHost(hostId);
 
-        // Issue 2: Validate vmId is a GUID to prevent PowerShell injection.
+        // Validate vmId is a GUID to prevent PowerShell injection.
         var safeVmId = InputValidation.ValidateVmId(vmId);
 
-        // The state-gate throw literal is byte-preserved — ErrorMapper substring-matches it
-        // upstream to produce INVALID_PARAMETER.
+        // Resume-VM can return mid-transition (Starting), so poll a stable terminal state before projecting.
+        // Keep the state-gate throw literal unchanged; its error mapping remains unresolved.
         var actionBlock = $@"if ($vm.State -ne 'Paused' -and $vm.State -ne 'PausedCritical' -and $vm.State -ne 'Saved') {{ throw ""Cannot resume VM in state '$($vm.State)'. VM must be Paused or Saved to resume."" }}
 Resume-VM -VM $vm
-# Re-fetch to get updated state
+$settleDeadline = (Get-Date).AddSeconds(10)
+while ((Get-Date) -lt $settleDeadline) {{
+    # WMI workaround : -ComputerName localhost avoids null-name WMI bug
+    $vm = Get-VM -Id '{safeVmId}' -ComputerName localhost
+    # break only on stable terminal states; the transient 'Starting' keeps polling
+    if ($vm.State -eq 'Running' -or $vm.State -eq 'Paused' -or $vm.State -eq 'PausedCritical' -or $vm.State -eq 'Saved' -or $vm.State -eq 'Off') {{ break }}
+    Start-Sleep -Milliseconds 250
+}}
 $vm = Get-VM -Id '{safeVmId}' -ComputerName localhost";
 
         _logger.LogInformation("Resuming VM '{VmId}' on host '{HostId}'", safeVmId, hostId);
@@ -1534,18 +1642,15 @@ $vm = Get-VM -Id '{safeVmId}' -ComputerName localhost";
         return ParseSingleVmInfo(result.Stdout, hostProfile.HostId);
     }
 
-    /// <inheritdoc />
-    /// <remarks>
-    /// Modifies VM configuration. Supports updating CPU count via Set-VMProcessor and/or
-    /// startup memory via Set-VMMemory. At least one of <paramref name="cpuCount"/> or
-    /// <paramref name="memoryMB"/> must be supplied (the dispatcher enforces this).
-    /// Returns updated VM info after applying the changes.
+    /// <inheritdoc /> <remarks> Modifies VM configuration. Supports updating CPU count via Set-VMProcessor and/or
+    /// startup memory via Set-VMMemory. At least one of <paramref name="cpuCount"/> or <paramref name="memoryMB"/>
+    /// must be supplied (the dispatcher enforces this). Returns updated VM info after applying the changes.
     /// </remarks>
     public async Task<VmInfo> ConfigureVmAsync(string hostId, string vmId, int? cpuCount, long? memoryMB, CancellationToken ct)
     {
         var hostProfile = ResolveLocalHost(hostId);
 
-        // Issue 2: Validate vmId is a GUID to prevent PowerShell injection.
+        // Validate vmId is a GUID to prevent PowerShell injection.
         var safeVmId = InputValidation.ValidateVmId(vmId);
 
         // Build the conditional Set-VM* lines. Values are validated numerics so direct
@@ -1557,14 +1662,10 @@ $vm = Get-VM -Id '{safeVmId}' -ComputerName localhost";
             ? $"Set-VMMemory -VM $vm -StartupBytes ({memoryMB.Value}MB)"
             : "# memoryMB not provided";
 
-        // PB-D7.f: The two Issue #56 rationale comment lines are emitted between the
-        // re-fetch and the projection — preserved byte-for-byte from the pre-refactor
-        // script. They are PowerShell no-ops but count toward the byte-identity invariant.
         var actionBlock = $@"{setProcessorLine}
 {setMemoryLine}
-# Re-fetch to get updated configuration
 $vm = Get-VM -Id '{safeVmId}' -ComputerName localhost
-# Issue #56 review: project MemoryStartup (configured) instead of MemoryAssigned,
+# review: project MemoryStartup (configured) instead of MemoryAssigned,
 # which Hyper-V reports as 0 for stopped VMs even after a successful Set-VMMemory.";
 
         _logger.LogInformation(
@@ -1578,86 +1679,50 @@ $vm = Get-VM -Id '{safeVmId}' -ComputerName localhost
     }
 
     /// <inheritdoc />
-    /// <remarks>
-    /// LF-D3: Performs hard power-off (Stop-VM -TurnOff), then removes the VM and cleans up VHDX files.
-    /// Uses -ErrorAction SilentlyContinue on Stop-VM to handle VMs that are already off.
-    /// See internal documentation
-    ///
-    /// Issue #25: After VHDX cleanup, also removes the now-empty per-VM directory
-    /// (e.g. C:\HyperVMCP\VMs\&lt;vmName&gt;\) recursively so the storage root does not
-    /// accumulate empty stub directories. Uses best-effort delete that is constrained
-    /// to the MCP-managed storage root (StorageRoot/&lt;vmName&gt;) so VMs created outside
-    /// our provisioning are never affected. See in-script safety guard.
-    /// </remarks>
+    /// <remarks>Hard power-off tolerates already-off VMs, then removes the VM and VHDXs.
+    /// Best-effort recursive directory cleanup is restricted to StorageRoot/<vmName> so unmanaged VMs are unaffected.</remarks>
     public async Task DestroyVmAsync(string hostId, string vmId, CancellationToken ct = default)
     {
         var hostProfile = ResolveLocalHost(hostId);
 
-        // Issue 2: Validate vmId is a GUID to prevent PowerShell injection.
+        // Validate vmId is a GUID to prevent PowerShell injection.
         var safeVmId = InputValidation.ValidateVmId(vmId);
 
-        // Issue #25 (Gate 6 finding #1): Resolve the expected MCP-managed storage root
-        // using the same resolution order as CreateVmAsync / OS install: env var >
-        // host profile > project default. The PowerShell script will only delete a
-        // per-VM directory if it matches "<storageRoot>/<vmName>" exactly.
+        // Resolve the same storage root as creation/install (environment > profile > default)
+        // so directory cleanup can require an exact StorageRoot/VM-name match.
         var storageRoot = Environment.GetEnvironmentVariable("HYPERV_MCP_STORAGE_ROOT")
             ?? hostProfile.StorageRoot
             ?? DefaultStorageRoot;
         var escapedStorageRoot = EscapePowerShellString(storageRoot);
 
-        // LF-D3: Hard power-off, not graceful shutdown.
-        // Collect VHDX paths before removing the VM so we can clean up storage.
-        //
-        // Issue #25 (Gate 6 finding #1): After VHDX deletion, also remove the per-VM
-        // directory recursively, but ONLY when it lives strictly under the MCP-managed
-        // storage root. Both paths are normalized via [System.IO.Path]::GetFullPath
-        // (which collapses any ".." / "." segments and trailing separators) and
-        // compared case-insensitively. If the resolved expected path is not a child of
-        // the resolved storage root, or the directory does not exist, the script skips
-        // deletion and emits a [WARN] line on stdout. This protects against a
-        // Hyper-V-reported $vm.Name containing path-traversal characters that could
-        // escape the storage root.
-        //
-        // Note: Remove-Item -Recurse -Force will delete non-empty contents too. The
-        // directory is expected to be empty after VHDX deletion above, but this
-        // operation is NOT restricted to empty directories — the safety guard above
-        // is what prevents collateral damage to non-managed paths.
-        //
-        // Design choice: best-effort delete with a [WARN] line on stdout (NOT a hard
-        // error). Rationale: the VM has already been removed and VHDXs deleted;
-        // failing to remove the now-empty stub directory should not turn a successful
-        // destroy into a failure. We use Write-Output "[WARN] ..." (instead of
-        // Write-Warning) so the message reliably appears in the executor's captured
-        // stdout regardless of stream-merging behavior.
+        // Collect disk paths before hard power-off/removal. Recursive cleanup can delete non-empty directories, so normalize paths,
+        // compare case-insensitively and require a strict child of the managed root to block VM-name traversal.
+        // Skip missing/unsafe paths; cleanup failure only warns because VM/disk removal already succeeded. Write-Output keeps warnings in captured stdout.
         var script = $@"
 $ErrorActionPreference = 'Stop'
 Import-Module Hyper-V -ErrorAction Stop
-# WMI workaround (LF-D7): -ComputerName localhost avoids null-name WMI bug
+# WMI workaround : -ComputerName localhost avoids null-name WMI bug
 $vm = Get-VM -Id '{safeVmId}' -ComputerName localhost
 if (-not $vm) {{ throw ""VM not found: {safeVmId}"" }}
 
 # Hard power-off (ignore errors if already off)
 $vm | Stop-VM -TurnOff -Force -ErrorAction SilentlyContinue
 
-# Collect VHDX paths before removal
 $vhdPaths = @((Get-VMHardDiskDrive -VM $vm).Path)
 
-# Compute expected per-VM directory under the MCP-managed storage root
 $expectedStorageRoot = '{escapedStorageRoot}'
 $vmName = $vm.Name
 $expectedVmDir = Join-Path $expectedStorageRoot $vmName
 
-# Remove the VM
 Remove-VM -VM $vm -Force
 
-# Clean up VHDX files
 foreach ($path in $vhdPaths) {{
     if ($path -and (Test-Path -LiteralPath $path)) {{
         Remove-Item -LiteralPath $path -Force
     }}
 }}
 
-# Issue #25: managed-path safety guard before per-VM directory removal
+# managed-path safety guard before per-VM directory removal
 $resolvedExpected = [System.IO.Path]::GetFullPath($expectedVmDir)
 $resolvedRoot = [System.IO.Path]::GetFullPath($expectedStorageRoot).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
 $rootPrefix = $resolvedRoot + [System.IO.Path]::DirectorySeparatorChar
@@ -1697,15 +1762,8 @@ Write-Output 'destroyed'
     }
 
     /// <inheritdoc />
-    /// <remarks>
-    /// Returns VMs filtered by name pattern (wildcard match) and optionally by hyper-v-mcp tag.
-    /// When nameFilter is provided, uses Get-VM -Name "*filter*" for wildcard matching.
-    ///
-    /// WMI workaround: All Get-VM calls use -ComputerName localhost to avoid the
-    /// "Value cannot be null. Parameter name: name" WMI provider bug on newer
-    /// Windows 11 builds (26200+) when Hyper-V cmdlets are invoked from non-interactive
-    /// PowerShell sessions. See internal documentation — LF-D7.
-    /// </remarks>
+    /// <remarks>Filters by wildcard name (*filter*) and optionally the hyper-v-mcp tag.
+    /// -ComputerName localhost avoids the non-interactive WMI null-name bug on Windows 11 26200+.</remarks>
     public async Task<IReadOnlyList<VmInfo>> ListVmsAsync(string hostId, string? nameFilter = null,
         CancellationToken ct = default)
     {
@@ -1719,15 +1777,10 @@ Write-Output 'destroyed'
         }
         else
         {
-            // Issue #8 + WMI workaround: Parameterless Get-VM and Get-VM -Name '*' both fail
-            // in the MCP server's spawned PowerShell process with "Value cannot be null.
-            // Parameter name: name" due to a WMI provider bug on Windows 11 build 26200+.
-            // Adding -ComputerName localhost forces the WMI provider through a code path
-            // that does not trigger the null-name bug.
+            // -ComputerName localhost avoids the Win11 26200+ WMI null-name bug in parameterless and wildcard Get-VM.
             getVmCommand = "$vms = Get-VM -Name '*' -ComputerName localhost";
         }
 
-        // Filter to VMs tagged with hyper-v-mcp in Notes, then output as JSON array.
         var script = $@"
 $ErrorActionPreference = 'Stop'
 Import-Module Hyper-V -ErrorAction Stop
@@ -1749,17 +1802,95 @@ if ($tagged.Count -eq 0) {{
         return ParseVmInfoList(result.Stdout, hostProfile.HostId);
     }
 
+    public async Task<IReadOnlyList<VmInfo>> FindVmsByNameAsync(
+        string hostId, string name, bool caseSensitive, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        if (string.IsNullOrWhiteSpace(name))
+            throw new ArgumentException("A non-blank VM name is required.", nameof(name));
+
+        var hostProfile = ResolveLocalHost(hostId);
+        const string script = """
+            Import-Module Hyper-V -ErrorAction Stop
+            ConvertTo-Json -InputObject @(Get-VM -Name '*' -ComputerName localhost -ErrorAction Stop |
+                Select-Object Id, Name, @{N='State';E={[string]$_.State}})
+            """;
+
+        PowerShellResult result;
+        try
+        {
+            result = await _psExecutor.ExecuteAsync(script, timeoutSeconds: 60, ct: ct);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception)
+        {
+            ct.ThrowIfCancellationRequested();
+            throw new VmLookupFailedException();
+        }
+
+        ct.ThrowIfCancellationRequested();
+        if (result.Cancelled)
+            throw new OperationCanceledException(ct);
+        if (!result.Success)
+            throw new VmLookupFailedException(result.ExitCode, result.Stderr);
+
+        try
+        {
+            using var document = JsonDocument.Parse(result.Stdout);
+            if (document.RootElement.ValueKind != JsonValueKind.Array)
+                throw new VmLookupFailedException(result.ExitCode, result.Stderr);
+
+            var matches = new List<VmInfo>();
+            var comparison = caseSensitive ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
+            foreach (var row in document.RootElement.EnumerateArray())
+            {
+                ct.ThrowIfCancellationRequested();
+                if (row.ValueKind != JsonValueKind.Object
+                    || !row.TryGetProperty("Id", out var vmId) || vmId.ValueKind != JsonValueKind.String
+                    || string.IsNullOrEmpty(vmId.GetString())
+                    || !row.TryGetProperty("Name", out var vmName) || vmName.ValueKind != JsonValueKind.String
+                    || string.IsNullOrEmpty(vmName.GetString())
+                    || !row.TryGetProperty("State", out var state) || state.ValueKind != JsonValueKind.String)
+                {
+                    throw new VmLookupFailedException(result.ExitCode, result.Stderr);
+                }
+
+                if (string.Equals(vmName.GetString(), name, comparison))
+                {
+                    matches.Add(new VmInfo
+                    {
+                        VmId = vmId.GetString()!,
+                        Name = vmName.GetString()!,
+                        State = state.GetString()!,
+                        HostId = hostProfile.HostId,
+                    });
+                }
+            }
+
+            ct.ThrowIfCancellationRequested();
+            return matches;
+        }
+        catch (JsonException)
+        {
+            ct.ThrowIfCancellationRequested();
+            throw new VmLookupFailedException(result.ExitCode, result.Stderr);
+        }
+    }
+
     /// <inheritdoc />
     public async Task<VmInfo> GetVmStatusAsync(string hostId, string vmId, CancellationToken ct = default)
     {
         var hostProfile = ResolveLocalHost(hostId);
 
-        // Issue 2: Validate vmId is a GUID to prevent PowerShell injection.
+        // Validate vmId is a GUID to prevent PowerShell injection.
         var safeVmId = InputValidation.ValidateVmId(vmId);
 
-        // PB-D7.g: empty actionBlock sentinel — read-only projection, no state change,
-        // no re-fetch. Emits one extra blank line in the script (PB-I8 documented no-op).
-        // Timeout stays at 30s per PB-D8 (NOT 120s).
+        // empty actionBlock sentinel — read-only projection, no state change,
+        // no re-fetch. Emits one extra blank line in the script ( documented no-op).
+        // Timeout stays at 30s per (NOT 120s).
         _logger.LogDebug("Getting status for VM '{VmId}' on host '{HostId}'", safeVmId, hostId);
 
         var result = await RunSingleVmActionAsync(safeVmId, actionBlock: "", timeoutSeconds: 30, ct: ct);
@@ -1769,34 +1900,13 @@ if ($tagged.Count -eq 0) {{
     }
 
     /// <inheritdoc />
-    /// <remarks>
-    /// Lists available base VHDX images from the configured image directory.
-    /// See internal documentation — Base Image Enumeration.
-    /// See internal documentation — ST-D7 (empty-config behavior).
-    ///
-    /// Resolution order (ST-D7):
-    ///   1. <c>HYPERV_MCP_IMAGE_DIR</c> environment variable.
-    ///   2. Host-profile <c>BaseVhdxPath</c> parent directory.
-    ///   3. <c>HYPERV_MCP_BASE_VHDX</c> environment variable parent directory.
-    ///   4. Unconfigured → returns successful empty list with <c>Configured=false</c>.
-    ///
-    /// Error mapping:
-    ///   - Configured directory does not exist → <see cref="ArgumentException"/> → INVALID_PARAMETER.
-    ///   - Configured directory exists but enumeration fails (ACL/IO) →
-    ///     <see cref="IoOperationFailedException"/> → IO_ERROR.
-    ///
-    /// WMI workaround (LF-D7): Get-VHD uses -ComputerName localhost to avoid
-    /// the "Value cannot be null" WMI provider bug on Windows 11 build 26200+.
-    /// </remarks>
+    /// <remarks>Image directory precedence: HYPERV_MCP_IMAGE_DIR, profile BaseVhdxPath parent, then HYPERV_MCP_BASE_VHDX parent.
+    /// Unconfigured returns success with Configured=false and no images. A missing configured path is INVALID_PARAMETER;
+    /// ACL/IO enumeration failure is IO_ERROR. Get-VHD uses localhost to avoid the Win11 26200+ WMI null-name bug.</remarks>
     public async Task<ImageListResult> ListImagesAsync(string hostId, CancellationToken ct = default)
     {
         var hostProfile = ResolveLocalHost(hostId);
 
-        // ST-D7 resolution order:
-        //   (1) HYPERV_MCP_IMAGE_DIR
-        //   (2) host-profile BaseVhdxPath parent
-        //   (3) HYPERV_MCP_BASE_VHDX parent
-        //   (4) unconfigured
         var imageDir = Environment.GetEnvironmentVariable("HYPERV_MCP_IMAGE_DIR");
         if (string.IsNullOrWhiteSpace(imageDir) && !string.IsNullOrWhiteSpace(hostProfile.BaseVhdxPath))
         {
@@ -1813,7 +1923,7 @@ if ($tagged.Count -eq 0) {{
 
         if (string.IsNullOrWhiteSpace(imageDir))
         {
-            // ST-D7: unconfigured is a soft, successful state — NOT an error envelope.
+            // unconfigured is a soft, successful state — NOT an error envelope.
             _logger.LogDebug(
                 "ListImagesAsync: no image directory configured on host '{HostId}'; returning empty list (ST-D7).",
                 hostId);
@@ -1827,22 +1937,9 @@ if ($tagged.Count -eq 0) {{
             };
         }
 
-        // ST-D7: a configured-but-missing directory is an operator-supplied path bug
-        // (INVALID_PARAMETER); a configured-but-unauthorized/IO-failing directory is
-        // IO_ERROR (Code Review Gate 6 Blocker #1, #54).
-        //
-        // PR #67 review (copilot-pull-request-reviewer, comment 3179029483):
-        // Do NOT pre-check with `Directory.Exists` / `DirectoryInfo.Exists` — both
-        // return `false` for ACL-denied paths, which would misclassify an
-        // IO/permission failure as INVALID_PARAMETER. Rely on a single probe via
-        // `EnumerateFileSystemEntries(...).GetEnumerator().MoveNext()` and let the
-        // catch arms classify: DirectoryNotFoundException → missing
-        // (INVALID_PARAMETER), UnauthorizedAccessException/IOException → IO_ERROR.
-        // The probe is one-step (cheap on the happy path).
-        // Issue #73: probe via injected IFileSystemProbe seam. The seam preserves
-        // native exception fidelity (DirectoryNotFoundException /
-        // UnauthorizedAccessException / IOException) so the catch arms below —
-        // and the downstream ErrorMapper envelope shape — remain unchanged.
+        // Do not use Directory.Exists: ACL denial also returns false and would become INVALID_PARAMETER instead of IO_ERROR.
+        // A one-step enumeration probe preserves native exceptions: missing directory maps to INVALID_PARAMETER;
+        // UnauthorizedAccessException/IOException map to IO_ERROR. The injected probe preserves the same envelope.
         try
         {
             _fileSystemProbe.ProbeDirectory(imageDir);
@@ -1856,7 +1953,7 @@ if ($tagged.Count -eq 0) {{
         }
         catch (UnauthorizedAccessException ex)
         {
-            // ST-D7: existing-but-unenumerable directory → IO_ERROR.
+            // existing-but-unenumerable directory → IO_ERROR.
             throw new IoOperationFailedException(
                 imageDir,
                 $"Configured image directory '{imageDir}' is not accessible: {ex.Message}",
@@ -1864,7 +1961,7 @@ if ($tagged.Count -eq 0) {{
         }
         catch (System.IO.IOException ex)
         {
-            // ST-D7: filesystem-level failure on enumeration probe → IO_ERROR.
+            // filesystem-level failure on enumeration probe → IO_ERROR.
             throw new IoOperationFailedException(
                 imageDir,
                 $"Configured image directory '{imageDir}' could not be enumerated: {ex.Message}",
@@ -1928,7 +2025,7 @@ if ($images.Count -eq 0) {{
         }
         catch (System.UnauthorizedAccessException uaEx)
         {
-            // ST-D7: ACL failure on enumeration → IO_ERROR (configured but unreadable).
+            // ACL failure on enumeration → IO_ERROR (configured but unreadable).
             throw new IoOperationFailedException(
                 imageDir!,
                 $"Cannot enumerate image directory '{imageDir}': access denied.",
@@ -1936,7 +2033,7 @@ if ($images.Count -eq 0) {{
         }
         catch (System.IO.IOException ioEx)
         {
-            // ST-D7: filesystem-level failure on enumeration → IO_ERROR.
+            // filesystem-level failure on enumeration → IO_ERROR.
             throw new IoOperationFailedException(
                 imageDir!,
                 $"Cannot enumerate image directory '{imageDir}': {ioEx.Message}",
@@ -1949,10 +2046,8 @@ if ($images.Count -eq 0) {{
         }
         catch (InvalidOperationException ioEx)
         {
-            // ST-D7: PS-side enumeration failures (e.g. Get-ChildItem access denied,
-            // VHDX read-locked) materialize as non-zero exit codes / stderr; promote
-            // these from the generic COMMAND_FAILED → IO_ERROR so the operator can
-            // distinguish "enumeration failed" from "wrong path".
+            // Promote PowerShell enumeration errors (access denial or locked VHDX) to IO_ERROR,
+            // not generic COMMAND_FAILED, so callers can distinguish unreadable storage from a wrong path.
             var stderr = ioEx.Message ?? string.Empty;
             if (stderr.Contains("UnauthorizedAccessException", StringComparison.OrdinalIgnoreCase)
                 || stderr.Contains("access is denied", StringComparison.OrdinalIgnoreCase)
@@ -1979,102 +2074,162 @@ if ($images.Count -eq 0) {{
         };
     }
 
-    /// <inheritdoc />
-    /// <remarks>
-    /// Polling-based readiness wait. Polls every 3 seconds up to timeoutSeconds.
-    /// VM is considered ready when:
-    ///   1. VM state is Running (State == 2)
-    ///   2. Heartbeat integration service reports "OK"
-    /// See internal documentation — Readiness Probes.
-    /// </remarks>
-    public async Task<VmInfo> WaitForReadyAsync(string hostId, string vmId, int timeoutSeconds = 300,
-        CancellationToken ct = default)
+    public Task<VmInfo> WaitForReadyAsync(string hostId, string vmId, int timeoutSeconds = 300,
+        CancellationToken ct = default) =>
+        WaitForReadyAsync(hostId, vmId, new ReadinessBudget(timeoutSeconds, _readinessClock), ct: ct);
+
+    public async Task<VmInfo> WaitForReadyAsync(
+        string hostId, string vmId, ReadinessBudget budget,
+        string? username = null, string? password = null, CancellationToken ct = default)
     {
-        var hostProfile = ResolveLocalHost(hostId);
-
-        // Issue 2: Validate vmId is a GUID to prevent PowerShell injection.
+        ArgumentNullException.ThrowIfNull(budget);
         var safeVmId = InputValidation.ValidateVmId(vmId);
-
-        // PowerShell script that polls VM state and heartbeat in a loop.
-        // Returns VM info JSON when ready, or throws on timeout.
-        var script = $@"
+        var hostProfile = ResolveLocalHost(hostId);
+        var (resolvedUsername, resolvedPassword) = CredentialResolver.ResolveCredentials(username, password);
+        var safeUsername = CredentialResolver.RedactPasswordRepresentations(resolvedUsername, resolvedPassword);
+        string? lastAccessObservation = null;
+        var heartbeatScript = $@"
 $ErrorActionPreference = 'Stop'
 Import-Module Hyper-V -ErrorAction Stop
-
-$vmId = '{safeVmId}'
-$timeoutSec = {timeoutSeconds}
-$pollIntervalSec = 3
-$deadline = (Get-Date).AddSeconds($timeoutSec)
-
-while ((Get-Date) -lt $deadline) {{
-    # WMI workaround (LF-D7): -ComputerName localhost avoids null-name WMI bug
-    $vm = Get-VM -Id $vmId -ComputerName localhost -ErrorAction SilentlyContinue
-    if (-not $vm) {{ throw ""VM not found: $vmId"" }}
-
-    if ($vm.State -eq 'Running') {{
-        # Check heartbeat integration service
-        $hb = (Get-VMIntegrationService -VM $vm | Where-Object {{$_.Name -eq 'Heartbeat'}}).PrimaryStatusDescription
-        if ($hb -eq 'OK') {{
-            # VM is ready — return info
-            $vm | Select-Object Id, Name, State, ProcessorCount, @{{N='MemoryMB';E={{$_.MemoryStartup/1MB}}}}, @{{N='UptimeSeconds';E={{$_.Uptime.TotalSeconds}}}} | ConvertTo-Json
-            return
-        }}
-    }}
-
-    Start-Sleep -Seconds $pollIntervalSec
-}}
-
-throw ""Timed out waiting for VM '$vmId' to become ready after $timeoutSec seconds""
+$vm = Get-VM -Id '{safeVmId}' -ComputerName localhost -ErrorAction SilentlyContinue
+if (-not $vm) {{ throw 'VM not found: {safeVmId}' }}
+$hb = (Get-VMIntegrationService -VM $vm | Where-Object {{$_.Name -eq 'Heartbeat'}}).PrimaryStatusDescription
+if ($hb -eq 'OK') {{ Write-Output 'HVMCP_HEARTBEAT_OK' }}
 ";
-
-        _logger.LogInformation("Waiting for VM '{VmId}' to become ready on host '{HostId}' (timeout={TimeoutSeconds}s)",
-            safeVmId, hostId, timeoutSeconds);
-
-        if (timeoutSeconds < 0)
-        {
-            throw new ArgumentOutOfRangeException(nameof(timeoutSeconds),
-                "Timeout must be zero (no timeout) or a positive number of seconds.");
-        }
-
-        var executorTimeoutSeconds = timeoutSeconds == 0 ? 0 : checked(timeoutSeconds + 30);
 
         try
         {
-            var result = await _psExecutor.ExecuteAsync(script, timeoutSeconds: executorTimeoutSeconds, ct: ct);
-            HandleError(result, hostProfile.HostId, safeVmId);
+            while (true)
+            {
+                budget.Check("retry", safeVmId, ct);
+                budget.Check("status", safeVmId, ct);
+                var vmInfo = await GetVmStatusAsync(hostId, safeVmId, ct).ConfigureAwait(false);
+                budget.Record("status-completed");
+                ct.ThrowIfCancellationRequested();
+                budget.LastObservation = $"VM state is '{vmInfo.State}'; guest login is unconfirmed. " + lastAccessObservation;
 
-            return ParseSingleVmInfo(result.Stdout, hostProfile.HostId);
+                if (string.Equals(vmInfo.State, "Running", StringComparison.OrdinalIgnoreCase))
+                {
+                    budget.Check("heartbeat", safeVmId, ct);
+                    var heartbeat = await _psExecutor.ExecuteAsync(heartbeatScript, ct: ct).ConfigureAwait(false);
+                    budget.Record("heartbeat-completed");
+                    ct.ThrowIfCancellationRequested();
+                    HandleError(heartbeat, hostProfile.HostId, safeVmId);
+                    if (TokenMatcher.ContainsToken(heartbeat.Stdout, "HVMCP_HEARTBEAT_OK"))
+                    {
+                        budget.LastObservation =
+                            "Running with heartbeat OK; heartbeat does not establish guest-login readiness. " + lastAccessObservation;
+                        var route = await ResolveReadinessRouteAsync(hostProfile, safeVmId, budget, ct).ConfigureAwait(false);
+                        var verdict = route.GuestOs == GuestOsKind.Linux
+                            ? await _readinessAuthenticator.ConfirmLinuxAsync(safeVmId, route.SshHost!, route.SshPort,
+                                resolvedUsername, resolvedPassword, budget, ct).ConfigureAwait(false)
+                            : await _readinessAuthenticator.ConfirmWindowsAsync(safeVmId, vmInfo.Name,
+                                resolvedUsername, resolvedPassword, budget, ct).ConfigureAwait(false);
+                        ct.ThrowIfCancellationRequested();
+                        if (verdict.Kind == ReadinessVerdictKind.Ready)
+                            return vmInfo;
+
+                        budget.LastObservation = verdict.CredentialRejected
+                            ? $"Credential rejection observed for username '{safeUsername}'. Verify credentials for the image, " +
+                                "or wait and retry after a recent start; neither cause has been established."
+                            : verdict.Observation;
+                        lastAccessObservation = budget.LastObservation;
+                        if (verdict.Kind == ReadinessVerdictKind.Terminal)
+                            throw budget.Failure(safeVmId,
+                                budget.Remaining <= TimeSpan.Zero ? "wait budget exhausted" : "observation failed");
+                    }
+                    else
+                    {
+                        budget.LastObservation =
+                            "VM is Running but heartbeat is not OK; guest login is unconfirmed. " + lastAccessObservation;
+                    }
+                }
+
+                await budget.DelayAsync(TimeSpan.FromSeconds(3), "retry-delay", safeVmId, ct).ConfigureAwait(false);
+            }
         }
-        catch (InvalidOperationException ex) when (ex.Message.Contains("Timed out waiting for VM"))
+        catch (Exception) when (ct.IsCancellationRequested)
         {
-            throw new TimeoutException(
-                $"VM '{safeVmId}' did not become ready within {timeoutSeconds} seconds.", ex);
+            throw new OperationCanceledException(ct);
+        }
+        catch (Exception failure) when (failure is not ReadinessNotReachedException
+            and not VmNotFoundException and not HostNotFoundException and not GuestRoutingUnavailableException
+            and not SshSessionOpenException and not NotSupportedException and not ConcurrencyLimitException)
+        {
+            budget.LastObservation = "Observation failed; the cause is unknown. Check host and guest access configuration.";
+            throw budget.Failure(safeVmId, budget.Remaining <= TimeSpan.Zero ? "wait budget exhausted" : "observation failed");
         }
     }
 
+    private async Task<GuestRoutingHint> ResolveReadinessRouteAsync(
+        HostProfile profile, string vmId, ReadinessBudget budget, CancellationToken ct)
+    {
+        budget.Check("classification", vmId, ct);
+        if (!_guestRoutingHintStore.TryGet(profile.HostId, vmId, out var hint))
+        {
+            budget.Check("kvp", vmId, ct);
+            hint = await _readinessOsProbe.ProbeAsync(profile.HostId, vmId, ct).ConfigureAwait(false);
+            budget.Record("kvp-completed");
+            if (hint is null)
+            {
+                budget.Check("endpoint", vmId, ct);
+                var endpoint = await _readinessOsProbe.ResolveVmScopedSshEndpointAsync(profile.HostId, vmId, ct)
+                    .ConfigureAwait(false);
+                budget.Record("endpoint-completed");
+                if (endpoint is not null)
+                {
+                    budget.Check("banner", vmId, ct);
+                    var responded = await _readinessBannerProbe(endpoint.Value.SshHost, endpoint.Value.SshPort, ct)
+                        .ConfigureAwait(false);
+                    budget.Record("banner-completed");
+                    if (responded)
+                        hint = new GuestRoutingHint(GuestOsKind.Linux, endpoint.Value.SshHost, endpoint.Value.SshPort);
+                }
+                if (hint is null)
+                {
+                    await budget.DelayAsync(TimeSpan.FromMilliseconds(250), "classification-settle", vmId, ct)
+                        .ConfigureAwait(false);
+                    budget.Check("kvp-retry", vmId, ct);
+                    hint = await _readinessOsProbe.ProbeAsync(profile.HostId, vmId, ct).ConfigureAwait(false);
+                    budget.Record("kvp-retry-completed");
+                }
+            }
+            if (hint is not null)
+                _guestRoutingHintStore.Record(profile.HostId, vmId, hint);
+        }
+
+        budget.Check("routing", vmId, ct);
+        if (hint is null)
+            throw new GuestRoutingUnavailableException(vmId,
+                $"The guest OS of VM '{vmId}' was not determined, so no transport was selected. " +
+                "The command can succeed once that guest's operating system becomes determinable.");
+
+        if (hint.GuestOs == GuestOsKind.Linux && hint.HasUsableSshEndpoint)
+            return hint;
+        if (hint.GuestOs == GuestOsKind.Linux || profile.IsLinuxGuest)
+        {
+            budget.Check("host-endpoint", vmId, ct);
+            var endpoint = profile.IsLinuxGuest ? profile.ResolveSshEndpoint() : null;
+            if (endpoint is not null)
+                return new GuestRoutingHint(GuestOsKind.Linux, endpoint.Value.SshHost, endpoint.Value.SshPort);
+            if (hint.GuestOs == GuestOsKind.Linux)
+                throw new GuestRoutingUnavailableException(vmId,
+                    $"The Linux guest '{vmId}' has no reachable SSH endpoint; guest routing failed closed.");
+            throw new SshSessionOpenException(vmId,
+                $"Failed to open an SSH session to the Linux guest '{vmId}': no reachable SSH endpoint is configured.");
+        }
+        return hint;
+    }
+
     /// <inheritdoc />
-    /// <remarks>
-    /// Lists all VMs tagged with <c>hyper-v-mcp:</c> in Notes and classifies each into one of:
-    /// <list type="bullet">
-    ///   <item><c>orphan</c> — creation timestamp parses AND is older than the 24h cutoff. Destroyed when <paramref name="dryRun"/> is false.</item>
-    ///   <item><c>unknown-age</c> — tagged but creation timestamp is missing or unparseable. <b>Reported but never auto-destroyed</b>, regardless of <paramref name="dryRun"/> (fail-closed).</item>
-    ///   <item><c>live</c> — within the cutoff. Not returned.</item>
-    /// </list>
-    /// Power state is <b>not</b> an input to the predicate — see decision LF-D10
-    /// in <c>internal documentation</c>
-    /// (fix for internal documentation).
-    /// </remarks>
+    /// <remarks>Only orphan-candidate rows may be destroyed (dryRun=false); needs-attention is report-only.
+    /// Live and untagged VMs are omitted. See VmInfo.Reason; power state and VM name never classify ownership.</remarks>
     public async Task<IReadOnlyList<VmInfo>> CleanupOrphansAsync(string hostId, bool dryRun = true,
         CancellationToken ct = default)
     {
         var hostProfile = ResolveLocalHost(hostId);
 
-        // Build a PowerShell script that:
-        // 1. Lists all VMs tagged with hyper-v-mcp:
-        // 2. Parses the creation timestamp from Notes (age-only predicate; LF-D10)
-        // 3. Classifies as 'orphan' (parseable + old) or 'unknown-age' (parse failure)
-        // 4. Destroys ONLY 'orphan' rows when -not $dryRun (unknown-age never auto-destroyed)
-        // 5. Returns both kinds of rows with a 'Reason' field
+        // Plain Notes parsing keeps classification identical across Windows and Linux/PowerShell-Direct; only orphan-candidates may be destroyed.
         var dryRunFlag = dryRun ? "$true" : "$false";
         var script = $@"
 $ErrorActionPreference = 'Stop'
@@ -2083,47 +2238,43 @@ Import-Module Hyper-V -ErrorAction Stop
 $dryRun = {dryRunFlag}
 $cutoffTime = (Get-Date).AddHours(-24)
 
-# WMI workaround (LF-D7): -ComputerName localhost avoids null-name WMI bug
+# WMI workaround : -ComputerName localhost avoids null-name WMI bug
 $allVms = Get-VM -Name '*' -ComputerName localhost -ErrorAction SilentlyContinue
 if (-not $allVms) {{ $allVms = @() }}
 
-# Filter to VMs tagged with hyper-v-mcp
 $tagged = @($allVms | Where-Object {{ $_.Notes -like '*hyper-v-mcp:*' }})
 
 $orphans = @()
 foreach ($vm in $tagged) {{
-    # LF-D10: age-only predicate. Power state is NOT an input.
-    # Three buckets: orphan (parseable + old), unknown-age (parse fail), live (skipped).
     $reason = $null
-    # LF-D10: regex excludes both whitespace AND ';' so trailing tag segments
-    # like ';type=iso-install' don't get glued onto the timestamp capture and
-    # cause [DateTimeOffset]::Parse to spuriously fail (which would fail-closed
-    # every iso-installed VM into 'unknown-age' forever).
-    if ($vm.Notes -match 'hyper-v-mcp:created=([^\s;]+)') {{
-        $createdAt = $null
+    # Anchor the role key on BOTH segment boundaries (start-of-string or after a
+    # ';'/whitespace delimiter) so a spoof segment like 'notrole=ephemeral;' cannot
+    # satisfy the ephemeral predicate and become an orphan-candidate.
+    $isEphemeral = $vm.Notes -match '(?:^|[\s;])role=ephemeral(?:$|[\s;])'
+    $createdAt = $null
+    # Anchor the created key on its left segment boundary too, and terminate the
+    # value at end/';'/whitespace so no adjacent segment can spoof or glue onto it.
+    if ($vm.Notes -match '(?:^|[\s;])hyper-v-mcp:created=([^\s;]+)') {{
         try {{
             $createdAt = [DateTimeOffset]::Parse($Matches[1])
         }} catch {{
             $createdAt = $null
         }}
-        if ($null -eq $createdAt) {{
-            # Fail-closed: tagged but unparseable timestamp -> report only, never destroy.
-            $reason = 'unknown-age'
-        }} elseif ($createdAt -lt $cutoffTime) {{
-            $reason = 'orphan'
-        }}
-        # else: within cutoff -> live, skip entirely.
+    }}
+
+    if ($isEphemeral -and $null -ne $createdAt -and $createdAt -lt $cutoffTime) {{
+        $reason = 'orphan-candidate'
+    }} elseif ($isEphemeral -and $null -ne $createdAt) {{
+        # Ephemeral + within cutoff -> live, skip entirely.
+        $reason = $null
     }} else {{
-        # LF-D10 contract: tagged with hyper-v-mcp: but NO 'created=' segment
-        # (or malformed/missing) -> fail-closed as 'unknown-age'. Reported but
-        # never auto-destroyed. Without this branch the row would be silently
-        # dropped, leaving a tagged VM the operator can't see in the report.
-        $reason = 'unknown-age'
+        # Fail-closed: owned but not a clean ephemeral+aged row -> report only.
+        $reason = 'needs-attention'
     }}
 
     if ($null -ne $reason) {{
-        # Only 'orphan' rows are eligible for destroy. 'unknown-age' is ALWAYS reported only.
-        if ($reason -eq 'orphan' -and -not $dryRun) {{
+        # Only 'orphan-candidate' rows are eligible for destroy ( parity).
+        if ($reason -eq 'orphan-candidate' -and -not $dryRun) {{
             # Destroy: stop + remove + cleanup VHDX (same as DestroyVmAsync)
             $vm | Stop-VM -TurnOff -Force -ErrorAction SilentlyContinue
             $vhdPaths = (Get-VMHardDiskDrive -VM $vm -ErrorAction SilentlyContinue).Path
@@ -2146,13 +2297,7 @@ foreach ($vm in $tagged) {{
     }}
 }}
 
-# Issue #207 / VC-CO-D2: defense-in-depth empty-host guard.
-# Some PS hosts can leave $orphans as $null (e.g., when no iterations ran in
-# the foreach), and `$null.Count` would surface as 0 only because PS coerces
-# $null to a single-element pipeline in some contexts. Guard explicitly on
-# $null OR an empty array, and force array semantics via -InputObject @(...)
-# so a single-element result is still emitted as a JSON array (not a bare
-# object). Depth 4 matches the inline shape above.
+# Handle null and empty orphan results explicitly; force array JSON even for one row (depth 4).
 if ($null -eq $orphans -or @($orphans).Count -eq 0) {{
     Write-Output '[]'
 }} else {{
@@ -2166,29 +2311,14 @@ if ($null -eq $orphans -or @($orphans).Count -eq 0) {{
         var result = await _psExecutor.ExecuteAsync(script, timeoutSeconds: 300, ct: ct);
         HandleError(result, hostProfile.HostId, vmId: null);
 
-        // Issue #207 / VC-CO-D3..D5: defense-in-depth C#-side filter for degenerate
-        // empty rows that some PS hosts can emit (e.g., a single `{}` element). This
-        // filter is scoped to CleanupOrphansAsync ONLY; ParseVmInfoList and
-        // MapJsonToVmInfo remain unchanged (design constraint C2).
+        // Filter degenerate empty rows only here so other VM parsers retain their behavior.
         var parsed = ParseVmInfoList(result.Stdout, hostProfile.HostId);
         return FilterEmptyOrphanRows(parsed, _logger, hostProfile.HostId, dryRun, result.Stdout);
     }
 
-    /// <summary>
-    /// Issue #207 / VC-CO-D3..D5 defense-in-depth filter scoped to
-    /// <see cref="CleanupOrphansAsync"/>. Drops rows that have both an empty
-    /// <see cref="VmInfo.VmId"/> AND an empty <see cref="VmInfo.Name"/>
-    /// (the "sentinel orphan" shape observed in TC-W14 / TC-L13). When at
-    /// least one row is dropped, emits exactly one structured warning so
-    /// operators can detect future PS-host regressions without changing the
-    /// public envelope.
-    /// </summary>
-    /// <remarks>
-    /// Per design constraint C2 this helper is the ONLY C#-side defense layer.
-    /// <see cref="ParseVmInfoList"/> and <see cref="MapJsonToVmInfo"/> are
-    /// intentionally untouched so all other call sites keep byte-identical
-    /// behavior (constraint C1).
-    /// </remarks>
+    /// <summary>Drops cleanup rows with both empty VmId and Name; logs one structured warning when any are dropped
+    /// so PS-host regressions remain visible without changing the envelope.
+    /// This is the only C# defense layer; ParseVmInfoList and MapJsonToVmInfo retain other callers' behavior.</summary>
     private static IReadOnlyList<VmInfo> FilterEmptyOrphanRows(
         IReadOnlyList<VmInfo> rows,
         ILogger<HyperVManager> logger,
@@ -2229,12 +2359,10 @@ if ($null -eq $orphans -or @($orphans).Count -eq 0) {{
         return kept.AsReadOnly();
     }
 
-    // ─── ISO Installation ───────────────────────────────────────────────────
 
     /// <summary>
     /// Autounattend.xml template for unattended Windows 11 installation.
     /// Placeholders: {locale}, {windowsEdition}, {adminPassword}, {productKeyElement}, {vmName}.
-    /// See internal documentation — Autounattend Template.
     /// </summary>
     private const string AutounattendTemplate = @"<?xml version=""1.0"" encoding=""utf-8""?>
 <unattend xmlns=""urn:schemas-microsoft-com:unattend"">
@@ -2347,15 +2475,10 @@ if ($null -eq $orphans -or @($orphans).Count -eq 0) {{
   </settings>
 </unattend>";
 
-    /// <summary>
-    /// Stripped-down unattend.xml template for specialize + oobeSystem passes only.
-    /// This file is copied to W:\Windows\Panther\unattend.xml by the WinPE DISM script.
-    /// It must NOT include the windowsPE pass (which has complex cmd.exe paths that
-    /// cause "Windows could not parse or process unattend answer file" errors).
-    /// All component elements require publicKeyToken for the specialize pass parser.
-    /// Placeholders: {locale}, {adminPassword}, {vmName}.
-    /// </summary>
-    private const string PantherUnattendTemplate = @"<?xml version=""1.0"" encoding=""utf-8""?>
+    /// <summary>WinPE DISM copies this specialize/oobeSystem template to W:\Windows\Panther\unattend.xml.
+    /// Exclude windowsPE: its complex cmd.exe paths cause answer-file parse errors. Every component needs publicKeyToken.
+    /// Placeholders: {locale}, {adminPassword}, {vmName}.</summary>
+    internal const string PantherUnattendTemplate = @"<?xml version=""1.0"" encoding=""utf-8""?>
 <unattend xmlns=""urn:schemas-microsoft-com:unattend"">
   <settings pass=""oobeSystem"">
     <component name=""Microsoft-Windows-International-Core""
@@ -2417,15 +2540,9 @@ if ($null -eq $orphans -or @($orphans).Count -eq 0) {{
   </settings>
 </unattend>";
 
-    /// <inheritdoc />
-    /// <remarks>
-    /// Implements the 13-step ISO installation orchestration from design doc.
-    /// Steps 1-8 failure: full rollback (destroy VM + delete artifacts).
-    /// Step 9 timeout: preserve VM, return INSTALL_TIMEOUT error with VM info.
-    /// Steps 9-11 failure: preserve VM, return error with VM info + cleanup artifacts.
-    /// See internal documentation — Internal Orchestration Sequence.
-    /// See internal documentation — Rollback Policy.
-    /// </remarks>
+    /// <inheritdoc /> <remarks> Implements the 13-step ISO installation orchestration from design doc. Steps 1-8
+    /// failure: full rollback (destroy VM + delete artifacts). Step 9 timeout: preserve VM, return INSTALL_TIMEOUT
+    /// error with VM info. Steps 9-11 failure: preserve VM, return error with VM info + cleanup artifacts. </remarks>
     public async Task<OsInstallResult> OsInstallAsync(
         string hostId,
         string name,
@@ -2440,17 +2557,9 @@ if ($null -eq $orphans -or @($orphans).Count -eq 0) {{
         string? productKey = null,
         int timeoutMinutes = 60,
         bool skipPreflight = false,
+        string? guestUsername = null,
         CancellationToken ct = default)
     {
-        // ──────────────────────────────────────────────────────────────────
-        // Issue #97 — Step 1: C#-side input validation BEFORE any PowerShell.
-        // Order matches internal documentation
-        // §"Step 1: Validate Inputs":
-        //   1. ISO existence            → ISO_NOT_FOUND
-        //   2. OS-family check (D16)    → OS_NOT_SUPPORTED  (always; never bypassable)
-        //   3. Resource-floor preflight → INSUFFICIENT_RESOURCES (gated by skipPreflight)
-        //   4. VM name uniqueness        → VM_ALREADY_EXISTS (still PS-side, cheap)
-        // ──────────────────────────────────────────────────────────────────
 
         // (1) ISO existence — fail fast with a typed exception so ErrorMapper emits
         // ISO_NOT_FOUND. The PS script also defends against this, but doing it here
@@ -2460,21 +2569,83 @@ if ($null -eq $orphans -or @($orphans).Count -eq 0) {{
             throw new IsoNotFoundException(isoPath ?? string.Empty);
         }
 
-        // (2) OS-family check (ISO-D16) — ALWAYS runs, NEVER bypassed by skipPreflight.
-        // Mounts the ISO read-only via PowerShell, looks for sources\install.wim,
-        // dismounts in a finally block (no leaked mounts on failure).
-        var (isWindows, diagnostic) = await _isoInspector
-            .ContainsWindowsInstallWimWithDiagnosticAsync(isoPath, ct)
-            .ConfigureAwait(false);
-        if (!isWindows)
+        // Classify media once before VM/job work; skipPreflight never bypasses this check.
+        // Reuse the mounted Ubuntu GRUB configuration for the capability check rather than mounting twice.
+        var classification = await _guestOsClassifier.ClassifyMediaAsync(isoPath, ct).ConfigureAwait(false);
+        var installTarget = classification.Target;
+
+        if (installTarget == InstallTarget.Unsupported)
         {
-            _logger.LogWarning(
-                "vm_os_install rejected non-Windows ISO '{IsoPath}': {Diagnostic}",
-                isoPath, diagnostic ?? "no install.wim found");
+            _logger.LogWarning("vm_os_install rejected unsupported ISO '{IsoPath}'.", isoPath);
             throw new OsNotSupportedException(isoPath);
         }
 
-        // (3) Resource-floor preflight (ISO-D17) — short-circuit on first failure.
+        if (installTarget == InstallTarget.UbuntuServer2404)
+        {
+            // Reject unsupported autoinstall media before resource checks, request construction or orchestration; skipPreflight cannot bypass it.
+            // Without the autoinstall kernel argument, stock media waits at subiquity's consent prompt for the whole timeout.
+            var capability = AutoinstallCapabilityEvaluator.Evaluate(classification.GrubConfiguration);
+            if (capability != AutoinstallCapability.Capable)
+            {
+                _logger.LogWarning(
+                    "vm_os_install refused Ubuntu ISO '{IsoPath}': autoinstall capability was {Capability}.",
+                    isoPath, capability);
+                throw new LinuxPreconditionUnmetException(
+                    AutoinstallCapabilityEvaluator.BuildRefusalMessage(capability, isoPath));
+            }
+
+            // Validate guestUsername early for Ubuntu; default to ubuntu. Windows ignores it.
+            var resolvedGuestUsername = string.IsNullOrWhiteSpace(guestUsername)
+                ? "ubuntu"
+                : InputValidation.ValidateGuestUsername(guestUsername);
+
+            // Ubuntu resource floors (1 vCPU / 2048 MB / 12 GB), still skipPreflight-gated (A.2).
+            // The Windows-11 floors below do NOT apply to Ubuntu.
+            if (!skipPreflight)
+            {
+                if (cpuCount < 1)
+                {
+                    throw new InsufficientResourcesException(
+                        failedFloor: "cpuCount", minimum: 1, actual: cpuCount,
+                        message: $"Ubuntu Server 24.04 requires minimum 1 vCPU (got {cpuCount}). Pass skipPreflight=true to bypass.");
+                }
+                if (memoryMB < 2048)
+                {
+                    throw new InsufficientResourcesException(
+                        failedFloor: "memoryMB", minimum: 2048, actual: memoryMB,
+                        message: $"Ubuntu Server 24.04 requires minimum 2048 MB RAM (got {memoryMB}). Pass skipPreflight=true to bypass.");
+                }
+                if (diskSizeGB < 12)
+                {
+                    throw new InsufficientResourcesException(
+                        failedFloor: "diskSizeGB", minimum: 12, actual: diskSizeGB,
+                        message: $"Ubuntu Server 24.04 requires minimum 12 GB disk (got {diskSizeGB}). Pass skipPreflight=true to bypass.");
+                }
+            }
+
+            _logger.LogInformation(
+                "Dispatching Ubuntu Server 24.04 autoinstall for VM '{VmName}' on host '{HostId}' from ISO '{IsoPath}'.",
+                name, hostId, isoPath);
+
+            var ubuntuRequest = new UbuntuInstallRequest
+            {
+                HostId = hostId,
+                Name = name,
+                IsoPath = isoPath,
+                AdminPassword = adminPassword,
+                GuestUsername = resolvedGuestUsername,
+                CpuCount = cpuCount,
+                MemoryMB = memoryMB,
+                DiskSizeGB = diskSizeGB,
+                SwitchName = switchName,
+                Locale = locale,
+                TimeoutMinutes = timeoutMinutes,
+            };
+            return await _ubuntuOrchestrator.InstallAsync(ubuntuRequest, ct).ConfigureAwait(false);
+        }
+
+
+        // (3) Resource-floor preflight — short-circuit on first failure.
         // Skipped entirely when skipPreflight=true. Caller-supplied values are surfaced
         // in the structured error so retries can adjust the right knob.
         if (!skipPreflight)
@@ -2513,7 +2684,6 @@ if ($null -eq $orphans -or @($orphans).Count -eq 0) {{
             ?? DefaultStorageRoot;
 
         // Resolve switch name: parameter > env var > host profile > "Default Switch".
-        // See internal documentation — ISO-D7.
         var resolvedSwitch = switchName
             ?? Environment.GetEnvironmentVariable("HYPERV_MCP_DEFAULT_SWITCH")
             ?? hostProfile.DefaultSwitch
@@ -2528,11 +2698,8 @@ if ($null -eq $orphans -or @($orphans).Count -eq 0) {{
         var escapedLocale = EscapePowerShellString(locale);
         var escapedEdition = EscapePowerShellString(windowsEdition);
 
-        // Generate autounattend XML content with parameter substitution.
-        // When no product key is provided, use the well-known Generic Volume License Key (GVLK)
-        // for the selected edition. These are Microsoft-published KMS client setup keys that
-        // allow Windows Setup to proceed without prompting — they do NOT activate Windows.
-        // See: https://learn.microsoft.com/windows-server/get-started/kms-client-activation-keys
+        // When no product key is supplied, published KMS client setup keys avoid Windows Setup prompts but do not activate Windows.
+        // See https://learn.microsoft.com/windows-server/get-started/kms-client-activation-keys
         var genericKeys = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
             ["Windows 11 Pro"] = "W269N-WFGWX-YVC9B-4J6C9-T83GX",
@@ -2579,22 +2746,25 @@ if ($null -eq $orphans -or @($orphans).Count -eq 0) {{
             .Replace("{vmName}", System.Security.SecurityElement.Escape(computerName));
         var escapedPantherXml = EscapePowerShellString(pantherUnattendXml);
 
+        // The IMAPI2 marshalling workaround MUST have a single definition; divergent copies have
+        // silently broken the stream cast before.
+        var autounattendImapi2Block = MediaAuthoringScripts.BuildImapi2AuthoringBlock(
+            sourceDirExpression: "$autounattendDir",
+            outputPathExpression: "$autounattendIsoPath",
+            volumeLabel: "AUTOUNATTEND",
+            fileSystemsToCreate: MediaAuthoringScripts.FileSystemsUdf,
+            failureMessagePrefix: "Failed to create autounattend ISO");
+
         _logger.LogInformation(
             "Starting OS installation for VM '{VmName}' on host '{HostId}' from ISO '{IsoPath}' " +
             "with {CpuCount} CPUs, {MemoryMB}MB RAM, {DiskSizeGB}GB disk, timeout={TimeoutMinutes}min",
             name, hostId, isoPath, cpuCount, memoryMB, diskSizeGB, timeoutMinutes);
 
-        // Build the comprehensive PowerShell script that performs all 13 steps.
-        // The script handles rollback internally and returns JSON with either
-        // success data or error info for the C# layer to interpret.
         var script = $@"
 $ErrorActionPreference = 'Stop'
 Import-Module Microsoft.PowerShell.Security -ErrorAction Stop
 Import-Module Hyper-V -ErrorAction Stop
 
-# ══════════════════════════════════════════════════════════════════
-# Parameters
-# ══════════════════════════════════════════════════════════════════
 $name = '{escapedName}'
 $isoPath = '{escapedIsoPath}'
 $adminPassword = '{escapedAdminPassword}'
@@ -2613,9 +2783,7 @@ $autounattendIsoPath = Join-Path $autounattendDir 'autounattend.iso'
 $warnings = @()
 $vmCreated = $false
 
-# ══════════════════════════════════════════════════════════════════
 # Rollback function for pre-installation failures (Steps 1-8)
-# ══════════════════════════════════════════════════════════════════
 function Invoke-FullRollback {{
     try {{
         $created = Get-VM -Name $name -ComputerName localhost -ErrorAction SilentlyContinue
@@ -2634,9 +2802,7 @@ function Invoke-FullRollback {{
     }} catch {{ }}
 }}
 
-# ══════════════════════════════════════════════════════════════════
 # Cleanup function for post-installation (temp artifacts only)
-# ══════════════════════════════════════════════════════════════════
 function Invoke-ArtifactCleanup {{
     try {{
         if (Test-Path $autounattendDir) {{
@@ -2648,15 +2814,8 @@ function Invoke-ArtifactCleanup {{
 }}
 
 try {{
-    # ══════════════════════════════════════════════════════════════
-    # Step 1: Validate Inputs
-    # ══════════════════════════════════════════════════════════════
-    # NOTE (Issue #97): Resource-floor preflight (cpuCount/memoryMB/diskSizeGB)
-    # has moved to the C#-side validator at the top of OsInstallAsync — it now
-    # emits structured INSUFFICIENT_RESOURCES errors and honors skipPreflight.
-    # The OS-family check (sources\install.wim, ISO-D16) also runs C#-side and
-    # is mandatory; non-Windows ISOs are rejected before this script runs.
-    # See internal documentation — ISO-D16, ISO-D17.
+    # Resource floors run in C# for structured INSUFFICIENT_RESOURCES errors and honor skipPreflight.
+    # The mandatory OS-family check rejects non-Windows media before this script runs.
     if (-not (Test-Path $isoPath)) {{
         [PSCustomObject]@{{
             success   = $false
@@ -2669,15 +2828,9 @@ try {{
     $existing = Get-VM -Name $name -ComputerName localhost -ErrorAction SilentlyContinue
     if ($existing) {{ throw ""VM with name '$name' already exists"" }}
 
-    # ══════════════════════════════════════════════════════════════
-    # Step 2: Create Empty VHDX
-    # ══════════════════════════════════════════════════════════════
     New-Item -ItemType Directory -Path $vmDir -Force | Out-Null
     New-VHD -Path $vhdxPath -SizeBytes $diskSizeBytes -Dynamic -ComputerName localhost | Out-Null
 
-    # ══════════════════════════════════════════════════════════════
-    # Step 3: Create Gen 2 VM with TPM + Secure Boot
-    # ══════════════════════════════════════════════════════════════
     New-VM -Name $name -Generation 2 -MemoryStartupBytes $memoryBytes `
            -VHDPath $vhdxPath -SwitchName $switchName -ComputerName localhost | Out-Null
     $vmCreated = $true
@@ -2686,12 +2839,9 @@ try {{
     Set-VMFirmware -VMName $name -EnableSecureBoot On -ComputerName localhost
     Set-VMKeyProtector -VMName $name -NewLocalKeyProtector -ComputerName localhost
     Enable-VMTPM -VMName $name -ComputerName localhost
-    Set-VM -Name $name -Notes ""hyper-v-mcp:created=$(Get-Date -Format o);type=iso-install"" `
+    Set-VM -Name $name -Notes ""hyper-v-mcp:created=$(Get-Date -Format o);type=iso-install;role=ephemeral"" `
            -ComputerName localhost
 
-    # ══════════════════════════════════════════════════════════════
-    # Step 4: Generate Autounattend.xml
-    # ══════════════════════════════════════════════════════════════
     New-Item -ItemType Directory -Path $autounattendDir -Force | Out-Null
     $xmlPath = Join-Path $autounattendDir 'Autounattend.xml'
     $xmlContent = '{escapedAutounattendXml}'
@@ -2703,103 +2853,27 @@ try {{
     $pantherXml = '{escapedPantherXml}'
     [System.IO.File]::WriteAllText($pantherXmlPath, $pantherXml, [System.Text.UTF8Encoding]::new($false))
 
-    # ══════════════════════════════════════════════════════════════
-    # Step 5: Create Autounattend ISO
-    # ══════════════════════════════════════════════════════════════
     $oscdimg = Get-Command oscdimg.exe -ErrorAction SilentlyContinue
     if ($oscdimg) {{
         & oscdimg.exe -u2 -udfver102 $autounattendDir $autounattendIsoPath 2>&1 | Out-Null
         if ($LASTEXITCODE -ne 0) {{ throw ""oscdimg.exe failed with exit code $LASTEXITCODE"" }}
     }} else {{
-        try {{
-            # Add C# helper to read IMAPI2FS COM IStream, which PowerShell cannot
-            # call directly because the COM IStream interface methods (Read, Stat, Seek)
-            # are not exposed through the COM interop wrapper in PowerShell 5.1.
-            # The C# helper casts to System.Runtime.InteropServices.ComTypes.IStream
-            # which has proper RCW marshalling support.
-            if (-not ([System.Management.Automation.PSTypeName]'IStreamHelper').Type) {{
-                Add-Type -TypeDefinition @'
-using System;
-using System.IO;
-using System.Runtime.InteropServices;
-using System.Runtime.InteropServices.ComTypes;
-
-public static class IStreamHelper
-{{
-    public static void WriteStreamToFile(object comStream, string filePath)
-    {{
-        IStream istream = (IStream)comStream;
-        System.Runtime.InteropServices.ComTypes.STATSTG stat;
-        istream.Stat(out stat, 0);
-        long totalBytes = stat.cbSize;
-        istream.Seek(0, 0, IntPtr.Zero);
-
-        byte[] buffer = new byte[65536];
-        long totalRead = 0;
-        using (FileStream fs = File.Create(filePath))
-        {{
-            while (totalRead < totalBytes)
-            {{
-                int toRead = (int)Math.Min(buffer.Length, totalBytes - totalRead);
-                IntPtr bytesReadPtr = Marshal.AllocHGlobal(4);
-                try
-                {{
-                    istream.Read(buffer, toRead, bytesReadPtr);
-                    int bytesRead = Marshal.ReadInt32(bytesReadPtr);
-                    if (bytesRead <= 0) break;
-                    fs.Write(buffer, 0, bytesRead);
-                    totalRead += bytesRead;
-                }}
-                finally
-                {{
-                    Marshal.FreeHGlobal(bytesReadPtr);
-                }}
-            }}
-        }}
-    }}
-}}
-'@ -Language CSharp
-            }}
-
-            $fsi = New-Object -ComObject IMAPI2FS.MsftFileSystemImage
-            $fsi.FileSystemsToCreate = 4  # UDF
-            $fsi.VolumeName = 'AUTOUNATTEND'
-            $fsi.Root.AddTree($autounattendDir, $false)
-            $resultImage = $fsi.CreateResultImage()
-            $resultStream = $resultImage.ImageStream
-            try {{
-                [IStreamHelper]::WriteStreamToFile($resultStream, $autounattendIsoPath)
-            }} finally {{
-                [System.Runtime.InteropServices.Marshal]::ReleaseComObject($resultStream) | Out-Null
-                [System.Runtime.InteropServices.Marshal]::ReleaseComObject($fsi) | Out-Null
-            }}
-        }} catch {{
-            throw ""Failed to create autounattend ISO: $($_.Exception.Message)""
-        }}
+{autounattendImapi2Block}
     }}
 
     if (-not (Test-Path $autounattendIsoPath)) {{
         throw ""Autounattend ISO was not created at $autounattendIsoPath""
     }}
 
-    # ══════════════════════════════════════════════════════════════
-    # Step 6: Mount ISOs
-    # ══════════════════════════════════════════════════════════════
     Add-VMDvdDrive -VMName $name -ControllerNumber 0 -ControllerLocation 1 `
                    -Path $isoPath -ComputerName localhost
     Add-VMDvdDrive -VMName $name -ControllerNumber 0 -ControllerLocation 2 `
                    -Path $autounattendIsoPath -ComputerName localhost
 
-    # ══════════════════════════════════════════════════════════════
-    # Step 7: Set DVD Boot Order
-    # ══════════════════════════════════════════════════════════════
     $dvd = Get-VMDvdDrive -VMName $name -ComputerName localhost |
            Where-Object {{ $_.ControllerLocation -eq 1 }}
     Set-VMFirmware -VMName $name -FirstBootDevice $dvd -ComputerName localhost
 
-    # ══════════════════════════════════════════════════════════════
-    # Step 8: Start VM
-    # ══════════════════════════════════════════════════════════════
     Start-VM -Name $name -ComputerName localhost
     $installStartTime = Get-Date
 
@@ -2832,10 +2906,7 @@ public static class IStreamHelper
     throw
 }}
 
-# ══════════════════════════════════════════════════════════════════
-# Step 9: Monitor Installation Progress
 # Post-step-8: failures preserve VM (no full rollback)
-# ══════════════════════════════════════════════════════════════════
 $timeoutAt = $installStartTime.AddMinutes($timeoutMinutes)
 $phase = 'installing'
 $previousUptime = [TimeSpan]::Zero
@@ -2921,9 +2992,6 @@ if ($phase -ne 'completed') {{
     return
 }}
 
-# ══════════════════════════════════════════════════════════════════
-# Step 10: Unmount ISOs + Set HDD Boot
-# ══════════════════════════════════════════════════════════════════
 try {{
     Get-VMDvdDrive -VMName $name -ComputerName localhost | ForEach-Object {{
         Set-VMDvdDrive -VMName $name -ControllerNumber $_.ControllerNumber `
@@ -2939,9 +3007,6 @@ try {{
     $warnings += ""Failed to unmount ISOs or set boot order: $($_.Exception.Message)""
 }}
 
-# ══════════════════════════════════════════════════════════════════
-# Step 11: Bootstrap VM (WinRM + PS remoting)
-# ══════════════════════════════════════════════════════════════════
 $bootstrapStartTime = Get-Date
 $bootstrapSuccess = $false
 $guestIp = $null
@@ -2953,10 +3018,8 @@ try {{
     while ((Get-Date) -lt $bootstrapTimeout) {{
         try {{
             $vm = Get-VM -Name $name -ComputerName localhost
-            # Module autoload can fail in non-console child PowerShell processes, surfacing as a
-            # misleading VirtualizationException from New-PSSession. The explicit
-            # Import-Module Microsoft.PowerShell.Security and Import-Module Hyper-V calls at the
-            # top of this bootstrap script mitigate that; -VMId is just the addressing form used here.
+            # Explicit Security and Hyper-V imports avoid misleading New-PSSession VirtualizationException from module autoload failures.
+            # -VMId is only the addressing form, not a WMI workaround.
             $session = New-PSSession -VMId $vm.Id -Credential $guestCredential -ErrorAction Stop
             break
         }} catch {{
@@ -2972,24 +3035,19 @@ try {{
     $bootstrapResult = Invoke-Command -Session $session -ScriptBlock {{
         $ErrorActionPreference = 'Stop'
 
-        # Enable PSRemoting
         Enable-PSRemoting -Force -SkipNetworkProfileCheck 2>&1 | Out-Null
 
-        # Set execution policy
         Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Force -Scope LocalMachine 2>&1 | Out-Null
 
-        # Enable WinRM
         Set-Service -Name WinRM -StartupType Automatic 2>&1 | Out-Null
         Start-Service -Name WinRM -ErrorAction SilentlyContinue 2>&1 | Out-Null
 
-        # Configure firewall rule for WinRM
         $rule = Get-NetFirewallRule -Name 'WINRM-HTTP-In-TCP' -ErrorAction SilentlyContinue
         if (-not $rule) {{
             New-NetFirewallRule -Name 'WINRM-HTTP-In-TCP' -DisplayName 'WinRM HTTP' `
                 -Direction Inbound -Protocol TCP -LocalPort 5985 -Action Allow 2>&1 | Out-Null
         }}
 
-        # Get guest IP address
         $ip = (Get-NetIPAddress -AddressFamily IPv4 |
                Where-Object {{ $_.InterfaceAlias -notlike '*Loopback*' -and $_.IPAddress -ne '127.0.0.1' }} |
                Select-Object -First 1).IPAddress
@@ -3010,14 +3068,8 @@ try {{
 
 $bootstrapDuration = ((Get-Date) - $bootstrapStartTime).TotalSeconds
 
-# ══════════════════════════════════════════════════════════════════
-# Step 12: Clean Up Temp Artifacts
-# ══════════════════════════════════════════════════════════════════
 Invoke-ArtifactCleanup
 
-# ══════════════════════════════════════════════════════════════════
-# Step 13: Return Result
-# ══════════════════════════════════════════════════════════════════
 $vm = Get-VM -Name $name -ComputerName localhost
 
 if (-not $bootstrapSuccess -and $bootstrapError) {{
@@ -3060,12 +3112,8 @@ if (-not $bootstrapSuccess -and $bootstrapError) {{
         // to allow for VM creation + installation + bootstrap + cleanup.
         var psTimeoutSeconds = (timeoutMinutes + 10) * 60;
 
-        // Security: The script contains plaintext credentials (admin password, product key).
-        // PowerShellExecutor writes it to a temp .ps1 file and cleans up in a finally block,
-        // but if the process crashes mid-execution, the temp file may persist.
-        // We track temp files before/after to ensure secondary cleanup of any lingering
-        // credential-bearing scripts.
-        // See internal documentation — Credential handling in temp files.
+        // A crash can leave the executor's temporary script containing plaintext credentials (admin password/product key).
+        // Track files before/after to provide secondary cleanup beyond the executor's finally block.
         var tempDir = Path.GetTempPath();
         var preExistingTempFiles = new HashSet<string>(
             Directory.GetFiles(tempDir, "hvmcp-*.ps1"), StringComparer.OrdinalIgnoreCase);
@@ -3073,10 +3121,9 @@ if (-not $bootstrapSuccess -and $bootstrapError) {{
         PowerShellResult result;
         try
         {
-            // SD-D4: OS-install scripts use a variable-backed credential pattern and embed
+            // OS-install scripts use a variable-backed credential pattern and embed
             // plaintext admin passwords in unattended XML; the v1 script-dump masker cannot
             // redact those, so dumping is disabled for this code path.
-            // See internal documentation §1, §5 (non-goal #6), and Decision SD-D4.
             result = await _psExecutor.ExecuteAsync(script, timeoutSeconds: psTimeoutSeconds, ct: ct, allowDump: false);
         }
         finally
@@ -3097,8 +3144,6 @@ if (-not $bootstrapSuccess -and $bootstrapError) {{
             catch { /* best-effort — don't mask the original exception */ }
         }
 
-        // Parse the JSON result from the PowerShell script.
-        // The script returns either a success envelope or an error envelope.
         if (!string.IsNullOrWhiteSpace(result.Stdout))
         {
             var trimmed = result.Stdout.Trim();
@@ -3191,7 +3236,7 @@ if (-not $bootstrapSuccess -and $bootstrapError) {{
         if (data.TryGetProperty("State", out var stateProp))
         {
             if (stateProp.ValueKind == JsonValueKind.Number && stateProp.TryGetInt32(out var stateInt))
-                result.State = VmStateMap.GetValueOrDefault(stateInt, $"Unknown({stateInt})");
+                result.State = LegacyNumericVmStateFallback.GetValueOrDefault(stateInt, $"Unknown({stateInt})");
             else
                 result.State = stateProp.GetString() ?? "Unknown";
         }
@@ -3229,7 +3274,6 @@ if (-not $bootstrapSuccess -and $bootstrapError) {{
         return result;
     }
 
-    // ─── Private Helpers ────────────────────────────────────────────────────
 
     /// <summary>
     /// Resolves the host profile and enforces local-only constraint for Phase 1.
@@ -3249,15 +3293,8 @@ if (-not $bootstrapSuccess -and $bootstrapError) {{
         return hostProfile;
     }
 
-    /// <summary>
-    /// Checks a <see cref="PowerShellResult"/> for errors and throws appropriate typed exceptions.
-    /// Maps PowerShell error messages to domain exceptions for consistent error handling.
-    ///
-    /// The <paramref name="isCreateOperation"/> flag prevents over-broad error classification:
-    /// during create operations, "not found" or "does not exist" errors typically refer to
-    /// missing base VHDX or invalid storage paths, NOT a missing VM. Only non-create operations
-    /// (get, start, stop, remove, checkpoint) should map these patterns to VmNotFoundException.
-    /// </summary>
+    /// <summary>Maps PowerShell errors to typed domain exceptions. During creation, missing paths usually mean a base VHDX
+    /// or storage path, not a missing VM; only lookup operations map these patterns to VmNotFoundException.</summary>
     private static void HandleError(PowerShellResult result, string hostId, string? vmId,
         string? vmName = null, bool isCreateOperation = false)
     {
@@ -3266,10 +3303,8 @@ if (-not $bootstrapSuccess -and $bootstrapError) {{
 
         var errorText = result.Stderr;
 
-        // Map known error patterns to typed exceptions.
-        // For create operations, "not found" / "does not exist" refers to missing base VHDX
-        // or invalid storage paths — NOT a missing VM. Only map to VmNotFoundException for
-        // operations that look up an existing VM (get, start, stop, remove, checkpoint).
+        // Missing paths during creation refer to base VHDX/storage, not a VM.
+        // Only existing-VM lookups may map them to VmNotFoundException.
         if (!isCreateOperation && ContainsAny(errorText, "not found", "does not exist", "could not find", "unable to find a virtual machine"))
         {
             // Prefer vmId when known; otherwise fall back to vmName so the error
@@ -3359,13 +3394,13 @@ if (-not $bootstrapSuccess -and $bootstrapError) {{
             ? nameProp.GetString() ?? string.Empty
             : string.Empty;
 
-        // Hyper-V State is an integer enum. Map to string name.
+        // The projection emits the state name; a number only survives in legacy/cached payloads.
         var state = "Unknown";
         if (element.TryGetProperty("State", out var stateProp))
         {
             if (stateProp.ValueKind == JsonValueKind.Number && stateProp.TryGetInt32(out var stateInt))
             {
-                state = VmStateMap.GetValueOrDefault(stateInt, $"Unknown({stateInt})");
+                state = LegacyNumericVmStateFallback.GetValueOrDefault(stateInt, $"Unknown({stateInt})");
             }
             else if (stateProp.ValueKind == JsonValueKind.String)
             {
@@ -3385,7 +3420,7 @@ if (-not $bootstrapSuccess -and $bootstrapError) {{
             ? (long)(uptimeProp.GetDouble())
             : 0L;
 
-        // Optional classification reason emitted by vm_cleanup_orphans (LF-D10).
+        // Optional classification reason emitted by vm_cleanup_orphans.
         // Absent for all other tools.
         string? reason = null;
         if (element.TryGetProperty("Reason", out var reasonProp) &&
@@ -3411,19 +3446,12 @@ if (-not $bootstrapSuccess -and $bootstrapError) {{
         };
     }
 
-    /// <summary>
-    /// Builds a PowerShell script snippet that guards the base VHDX against mutation
-    /// (ADR-4 / ST-D1, refined by ST-D6a).
-    ///
-    /// As of ST-D6a, SHA-256 is computed host-side via <see cref="IBaseImageHashCache"/>
-    /// — NOT inline here — so the cache cannot be bypassed by pipeline cancellation
-    /// and the dual-hash cost is paid at most once per (path, stat-tuple, TTL).
-    /// This snippet now only enforces the ReadOnly filesystem attribute.
-    /// </summary>
+    /// <summary>Enforces only the ReadOnly attribute; SHA-256 hashing belongs to IBaseImageHashCache outside PowerShell
+    /// so pipeline cancellation cannot bypass the cache and hashing is shared per path/stat-tuple/TTL.</summary>
     private static string BuildBaseVhdxGuardScript(string escapedBaseVhdx)
     {
         return $@"
-# ADR-4 / ST-D1 (refined by ST-D6a): Base VHDX mutation guard — ReadOnly enforcement only.
+# (refined by ): Base VHDX mutation guard — ReadOnly enforcement only.
 # SHA-256 pre/post hashing is owned by managed code (IBaseImageHashCache).
 if (-not (Get-ItemProperty -LiteralPath '{escapedBaseVhdx}' -Name IsReadOnly).IsReadOnly) {{
     Set-ItemProperty -LiteralPath '{escapedBaseVhdx}' -Name IsReadOnly -Value $true
@@ -3526,12 +3554,9 @@ if (-not (Get-ItemProperty -LiteralPath '{escapedBaseVhdx}' -Name IsReadOnly).Is
         };
     }
 
-    /// <inheritdoc />
-    /// <remarks>
-    /// Issue #51: Returns the host-side absolute path to the VM's primary VHDX
-    /// via <c>Get-VMHardDiskDrive | Select-Object -First 1</c>. Used by
-    /// <c>vm_create_base_image</c> to locate the disk to copy.
-    /// </remarks>
+    /// <inheritdoc /> <remarks> Returns the host-side absolute path to the VM's primary VHDX via
+    /// <c>Get-VMHardDiskDrive | Select-Object -First 1</c>. Used by <c>vm_create_base_image</c> to locate the disk to
+    /// copy. </remarks>
     public async Task<string> GetPrimaryVhdxPathAsync(string hostId, string vmName,
         CancellationToken ct = default)
     {
@@ -3547,7 +3572,7 @@ if (-not (Get-ItemProperty -LiteralPath '{escapedBaseVhdx}' -Name IsReadOnly).Is
 $ErrorActionPreference = 'Stop'
 Import-Module Hyper-V -ErrorAction Stop
 
-# WMI workaround (LF-D7): -ComputerName localhost avoids null-name WMI bug
+# WMI workaround : -ComputerName localhost avoids null-name WMI bug
 $vm = Get-VM -Name '{escapedName}' -ComputerName localhost -ErrorAction SilentlyContinue
 if (-not $vm) {{ throw ""VM not found: {escapedName}"" }}
 

@@ -119,6 +119,9 @@ public class ErrorEnvelopeTests
     [InlineData("INSUFFICIENT_PRIVILEGE", "Security")]
     [InlineData("CONCURRENCY_LIMIT", "Operational")]
     [InlineData("OPERATION_CANCELED", "Operational")]
+    [InlineData("LINUX_INSTALL_TIMEOUT", "Linux Install")]
+    [InlineData("LINUX_PROVISION_FAILED", "Linux Install")]
+    [InlineData("LINUX_PRECONDITION_UNMET", "Linux Install")]
     public void ErrorCode_Is_Defined_In_Taxonomy(string errorCode, string expectedCategory)
     {
         // Verify the error code constant exists
@@ -133,16 +136,20 @@ public class ErrorEnvelopeTests
     }
 
     /// <summary>
-    /// ErrorCodes class must contain exactly 32 error codes matching the taxonomy.
+    /// ErrorCodes class must contain exactly 38 error codes matching the taxonomy.
     /// Original 18 + 4 ISO installation codes + MISSING_CREDENTIALS + IO_ERROR
     /// + OS_NOT_SUPPORTED + INSUFFICIENT_RESOURCES
     /// + 4 base-image codes (SYSPREP_FAILED, IMAGE_COPY_FAILED, MERGE_NOT_SUPPORTED,
     /// CHECKPOINT_MERGE_FAILED — Issue #51)
     /// + OPERATION_CANCELED (Issue #164 / LF-D17)
-    /// + DEST_DIR_MISSING (Issue #204 / VC-DEST-D2).
+    /// + DEST_DIR_MISSING (Issue #204 / VC-DEST-D2)
+    /// + LINUX_INSTALL_TIMEOUT + LINUX_PROVISION_FAILED + LINUX_PRECONDITION_UNMET
+    /// (Issue #208 / ISO-D27)
+    /// + BASE_NOT_GENERALIZED + READINESS_NOT_REACHED (Issue #283 — password-bearing vm_create)
+    /// + VM_STATE_CONFLICT (Issue #330 — vm_pause terminal divergence).
     /// </summary>
     [Fact]
-    public void ErrorCodes_Contains_Exactly_32_Codes()
+    public void ErrorCodes_Contains_Exactly_38_Codes()
     {
         var allCodes = typeof(ErrorCodes)
             .GetFields(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)
@@ -151,17 +158,26 @@ public class ErrorEnvelopeTests
 
         var codeCount = allCodes.Count;
 
-        // Issue #204 / VC-DEST-D2 added DEST_DIR_MISSING → 32 total.
-        codeCount.Should().Be(32,
-            "the error taxonomy defines 32 error codes: original 18 + 4 ISO installation codes + MISSING_CREDENTIALS + IO_ERROR (ST-D7 / Issue #54) " +
+        // Issue #330 added the vm_pause terminal-divergence code → 38 total (+1 from 37).
+        codeCount.Should().Be(38,
+            "the error taxonomy defines 38 error codes: original 18 + 4 ISO installation codes + MISSING_CREDENTIALS + IO_ERROR (ST-D7 / Issue #54) " +
             "+ OS_NOT_SUPPORTED + INSUFFICIENT_RESOURCES (Issue #97 / ISO-D16 + ISO-D17) " +
             "+ SYSPREP_FAILED + IMAGE_COPY_FAILED + MERGE_NOT_SUPPORTED + CHECKPOINT_MERGE_FAILED (Issue #51) " +
             "+ OPERATION_CANCELED (Issue #164 / LF-D17) " +
             "+ DEST_DIR_MISSING (Issue #204 / VC-DEST-D2) " +
+            "+ LINUX_INSTALL_TIMEOUT + LINUX_PROVISION_FAILED + LINUX_PRECONDITION_UNMET (Issue #208 / ISO-D27) " +
+            "+ BASE_NOT_GENERALIZED + READINESS_NOT_REACHED (Issue #283) " +
+            "+ VM_STATE_CONFLICT (Issue #330 / LF-D36) " +
             "(see internal documentation — Error Code Taxonomy)");
+
+        allCodes.Should().Contain("VM_STATE_CONFLICT",
+            "Issue #330 / LF-D36: VM_STATE_CONFLICT must be present in the catalog");
 
         allCodes.Should().Contain("DEST_DIR_MISSING",
             "Issue #204 / VC-DEST-D2: DEST_DIR_MISSING must be present in the catalog");
+
+        allCodes.Should().Contain(new[] { "LINUX_INSTALL_TIMEOUT", "LINUX_PROVISION_FAILED", "LINUX_PRECONDITION_UNMET" },
+            "Issue #208 / ISO-D27: the three Linux install codes must be present in the catalog");
     }
 
     // ─── JSON Wire Format ──────────────────────────────────────────────

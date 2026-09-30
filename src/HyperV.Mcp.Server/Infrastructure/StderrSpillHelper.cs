@@ -237,6 +237,16 @@ internal static class StderrSpillHelper
         }
         catch { /* swallow */ }
 
+        // 4. PEM / SSH private-key blocks (issue #209 / LGS-SSH-D6): strip the whole
+        // BEGIN...PRIVATE KEY / END...PRIVATE KEY envelope, including the multi-line
+        // base64 body, so SSH stdout/stderr/exception text that echoes key material
+        // cannot reach a CommandResult, error string, or log.
+        try
+        {
+            result = PrivateKeyBlockRegex.Replace(result, "***REDACTED-PRIVATE-KEY***");
+        }
+        catch { /* regex runaway must never break logging */ }
+
         return result;
     }
 
@@ -260,6 +270,21 @@ internal static class StderrSpillHelper
     private static readonly Regex CredentialParamRegex = new(
         @"-Credential\s+\S+",
         RegexOptions.Multiline | RegexOptions.IgnoreCase);
+
+    /// <summary>
+    /// Cached defensive redaction regex for PEM / OpenSSH / PGP private-key blocks. Matches the
+    /// standard BEGIN [ANY] PRIVATE KEY[ BLOCK] / END [ANY] PRIVATE KEY[ BLOCK] envelope
+    /// (RSA/EC/DSA/OPENSSH/generic PRIVATE KEY plus the PGP `PRIVATE KEY BLOCK` armor) and
+    /// replaces the entire block (header, multi-line base64 body, and footer) with a placeholder.
+    /// The optional ` BLOCK` suffix on both markers is what covers PGP armor while still requiring
+    /// the literal BEGIN/END private-key envelope, so unrelated text is not over-matched.
+    /// Singleline lets the dot span newlines so the base64 body is removed, not just the header
+    /// line; IgnoreCase tolerates casing. The body is matched lazily so surrounding noisy text is
+    /// not swallowed past the END marker.
+    /// </summary>
+    private static readonly Regex PrivateKeyBlockRegex = new(
+        @"-----BEGIN[ \t]+[A-Z0-9 ]*PRIVATE KEY( BLOCK)?-----.*?-----END[ \t]+[A-Z0-9 ]*PRIVATE KEY( BLOCK)?-----",
+        RegexOptions.Singleline | RegexOptions.IgnoreCase);
 
     /// <summary>
     /// Enforce the soft rotation cap by deleting the oldest spill files first

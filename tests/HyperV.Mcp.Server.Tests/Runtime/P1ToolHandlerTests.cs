@@ -8,26 +8,12 @@ using Xunit;
 
 namespace HyperV.Mcp.Server.Tests.Runtime;
 
-/// <summary>
-/// Tests for P1 tool handlers in ToolDispatcher.
-/// Each test exercises the full dispatch pipeline: ToolDispatcher.DispatchAsync →
-/// argument extraction → concurrency gate → service delegation → response wrapping.
-/// See internal documentation — Stage 1.5: P1 Tool Handlers.
-///
-/// All tests use mocked infrastructure services to verify:
-/// - Correct argument extraction and forwarding to service methods
-/// - Default values for optional arguments (hostId → "local", shell → "powershell", etc.)
-/// - Concurrency gate acquisition (global slot + per-VM/host locks)
-/// - Error mapping when services throw domain exceptions
-/// - Missing required parameter validation
-/// </summary>
+/// <summary>Exercises argument extraction, concurrency, delegation and response wrapping through real dispatch with mocked services. Covers
+/// defaults, global/per-VM/host locks, domain-error mapping and required-parameter validation.</summary>
 [Trait("Category", "Runtime")]
 public class P1ToolHandlerTests
 {
-    /// <summary>
-    /// Canonical VM GUID used across all P1 tool tests.
-    /// All handlers now call InputValidation.ValidateVmId() which requires a valid GUID.
-    /// </summary>
+    /// <summary>Handlers validate VM IDs as GUIDs.</summary>
     private const string TestVmGuid = "12345678-1234-1234-1234-123456789abc";
 
     private readonly Mock<IHyperVManager> _hvManager = new();
@@ -37,15 +23,10 @@ public class P1ToolHandlerTests
     private readonly Mock<IHostResolver> _hostResolver = new();
     private readonly Mock<IConcurrencyGate> _gate = new();
 
-    /// <summary>
-    /// Creates a ToolDispatcher with the class-level mocks and real ErrorMapper.
-    /// All concurrency gates grant locks immediately by default.
-    /// </summary>
     private ToolDispatcher CreateDispatcher(ServerOptions? options = null)
     {
         var serverOptions = options ?? new ServerOptions();
 
-        // Default: all concurrency locks succeed immediately
         _gate.Setup(g => g.AcquireGlobalSlotAsync(It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(Mock.Of<IDisposable>());
         _gate.Setup(g => g.AcquireHostLockAsync(It.IsAny<string>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
@@ -53,7 +34,7 @@ public class P1ToolHandlerTests
         _gate.Setup(g => g.AcquireVmLockAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(Mock.Of<IDisposable>());
 
-        // Default: GetVmStatusAsync returns a Running VM (needed for vm_run_script, vm_get_file state precondition)
+        // A Running VM satisfies script and file-transfer state preconditions.
         _hvManager.Setup(m => m.GetVmStatusAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new VmInfo { VmId = TestVmGuid, Name = "test-vm", State = "Running", HostId = "local" });
 
@@ -70,14 +51,7 @@ public class P1ToolHandlerTests
             serverOptions);
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // vm_run_script Tests
-    // ═══════════════════════════════════════════════════════════════════
 
-    /// <summary>
-    /// vm_run_script dispatches to ICommandExecutor.ExecuteScriptAsync with correct arguments.
-    /// See internal documentation — CMD-D1.
-    /// </summary>
     [Fact]
     public async Task VmRunScript_Dispatches_To_CommandExecutor_ExecuteScriptAsync()
     {
@@ -105,10 +79,6 @@ public class P1ToolHandlerTests
             "vm_run_script must forward all parameters to ExecuteScriptAsync");
     }
 
-    /// <summary>
-    /// vm_run_script defaults shell to "powershell" when not provided.
-    /// See internal documentation — CMD-D1: default shell for scripts.
-    /// </summary>
     [Fact]
     public async Task VmRunScript_Default_Shell_Is_Powershell()
     {
@@ -122,7 +92,6 @@ public class P1ToolHandlerTests
             {
                 ["vmId"] = TestVmGuid,
                 ["script"] = "Write-Host 'hello'"
-                // shell omitted — should default to "powershell"
             },
             CancellationToken.None);
 
@@ -133,9 +102,6 @@ public class P1ToolHandlerTests
             "vm_run_script must default shell to 'powershell' when not provided");
     }
 
-    /// <summary>
-    /// vm_run_script defaults timeout to 60 seconds when not provided.
-    /// </summary>
     [Fact]
     public async Task VmRunScript_Default_Timeout_Is_60()
     {
@@ -149,7 +115,6 @@ public class P1ToolHandlerTests
             {
                 ["vmId"] = TestVmGuid,
                 ["script"] = "Get-Date"
-                // timeoutSeconds omitted — should default to 60
             },
             CancellationToken.None);
 
@@ -160,11 +125,6 @@ public class P1ToolHandlerTests
             "vm_run_script must default timeoutSeconds to 60 when not provided");
     }
 
-    /// <summary>
-    /// vm_run_script returns success=false with COMMAND_TIMEOUT errorCode
-    /// when the script execution times out.
-    /// See internal documentation — CMD-D4.
-    /// </summary>
     [Fact]
     public async Task VmRunScript_TimedOut_Returns_Failure()
     {
@@ -189,10 +149,6 @@ public class P1ToolHandlerTests
             "timed-out script must map to COMMAND_TIMEOUT error code");
     }
 
-    /// <summary>
-    /// vm_run_script returns success=false with COMMAND_FAILED errorCode
-    /// when the script exits with non-zero exit code.
-    /// </summary>
     [Fact]
     public async Task VmRunScript_NonZeroExitCode_Returns_Failure()
     {
@@ -217,9 +173,6 @@ public class P1ToolHandlerTests
             "non-zero exit code must map to COMMAND_FAILED error code");
     }
 
-    /// <summary>
-    /// vm_run_script without required 'vmId' parameter returns INVALID_PARAMETER.
-    /// </summary>
     [Fact]
     public async Task VmRunScript_Missing_VmId_Returns_Error()
     {
@@ -228,7 +181,6 @@ public class P1ToolHandlerTests
             new Dictionary<string, object?>
             {
                 ["script"] = "Get-Date"
-                // 'vmId' is missing
             },
             CancellationToken.None);
 
@@ -238,9 +190,6 @@ public class P1ToolHandlerTests
             "missing required 'vmId' must map to INVALID_PARAMETER");
     }
 
-    /// <summary>
-    /// vm_run_script without required 'script' parameter returns INVALID_PARAMETER.
-    /// </summary>
     [Fact]
     public async Task VmRunScript_Missing_Script_Returns_Error()
     {
@@ -249,7 +198,6 @@ public class P1ToolHandlerTests
             new Dictionary<string, object?>
             {
                 ["vmId"] = TestVmGuid
-                // 'script' is missing
             },
             CancellationToken.None);
 
@@ -259,14 +207,7 @@ public class P1ToolHandlerTests
             "missing required 'script' must map to INVALID_PARAMETER");
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // vm_get_file Tests
-    // ═══════════════════════════════════════════════════════════════════
 
-    /// <summary>
-    /// vm_get_file dispatches to IFileTransferService.CopyFromGuestAsync with correct arguments.
-    /// See internal documentation — FT-D2, FT-D3.
-    /// </summary>
     [Fact]
     public async Task VmGetFile_Dispatches_To_FileTransferService_CopyFromGuestAsync()
     {
@@ -301,10 +242,6 @@ public class P1ToolHandlerTests
             "vm_get_file must delegate to IFileTransferService.CopyFromGuestAsync with correct arguments");
     }
 
-    /// <summary>
-    /// vm_get_file defaults hostId to "local" when not provided.
-    /// See internal documentation — MCP-D3: default hostId = "local".
-    /// </summary>
     [Fact]
     public async Task VmGetFile_Default_HostId_Is_Local()
     {
@@ -327,7 +264,6 @@ public class P1ToolHandlerTests
                 ["vmId"] = TestVmGuid,
                 ["sourcePath"] = @"C:\guest\file.txt",
                 ["destPath"] = @"C:\host\file.txt"
-                // hostId omitted — should default to "local"
             },
             CancellationToken.None);
 
@@ -338,9 +274,6 @@ public class P1ToolHandlerTests
             "hostId must default to 'local' when not provided (MCP-D3)");
     }
 
-    /// <summary>
-    /// vm_get_file without required 'sourcePath' parameter returns INVALID_PARAMETER.
-    /// </summary>
     [Fact]
     public async Task VmGetFile_Missing_SourcePath_Returns_Error()
     {
@@ -350,7 +283,6 @@ public class P1ToolHandlerTests
             {
                 ["vmId"] = TestVmGuid,
                 ["destPath"] = @"C:\host\file.txt"
-                // 'sourcePath' is missing
             },
             CancellationToken.None);
 
@@ -360,9 +292,6 @@ public class P1ToolHandlerTests
             "missing required 'sourcePath' must map to INVALID_PARAMETER");
     }
 
-    /// <summary>
-    /// vm_get_file without required 'destPath' parameter returns INVALID_PARAMETER.
-    /// </summary>
     [Fact]
     public async Task VmGetFile_Missing_DestPath_Returns_Error()
     {
@@ -372,7 +301,6 @@ public class P1ToolHandlerTests
             {
                 ["vmId"] = TestVmGuid,
                 ["sourcePath"] = @"C:\guest\file.txt"
-                // 'destPath' is missing
             },
             CancellationToken.None);
 
@@ -382,14 +310,7 @@ public class P1ToolHandlerTests
             "missing required 'destPath' must map to INVALID_PARAMETER");
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // vm_restart Tests
-    // ═══════════════════════════════════════════════════════════════════
 
-    /// <summary>
-    /// vm_restart dispatches to IHyperVManager.RestartVmAsync with correct arguments.
-    /// See internal documentation — Capability Matrix: vm_restart.
-    /// </summary>
     [Fact]
     public async Task VmRestart_Dispatches_To_HyperVManager_RestartVmAsync()
     {
@@ -414,10 +335,6 @@ public class P1ToolHandlerTests
             "vm_restart must delegate to IHyperVManager.RestartVmAsync with correct vmId and hostId");
     }
 
-    /// <summary>
-    /// vm_restart defaults hostId to "local" when not provided.
-    /// See internal documentation — MCP-D3: default hostId = "local".
-    /// </summary>
     [Fact]
     public async Task VmRestart_Default_HostId_Is_Local()
     {
@@ -430,7 +347,6 @@ public class P1ToolHandlerTests
             new Dictionary<string, object?>
             {
                 ["vmId"] = TestVmGuid
-                // hostId omitted — should default to "local"
             },
             CancellationToken.None);
 
@@ -441,10 +357,6 @@ public class P1ToolHandlerTests
             "hostId must default to 'local' when not provided (MCP-D3)");
     }
 
-    /// <summary>
-    /// vm_restart returns VM_NOT_FOUND when the VM does not exist.
-    /// See internal documentation — Error Code Taxonomy: VM_NOT_FOUND.
-    /// </summary>
     [Fact]
     public async Task VmRestart_VmNotFound_Returns_Error()
     {
@@ -468,19 +380,14 @@ public class P1ToolHandlerTests
             "VmNotFoundException from service must map to VM_NOT_FOUND through dispatcher error pipeline");
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // vm_wait_ready Tests
-    // ═══════════════════════════════════════════════════════════════════
 
-    /// <summary>
-    /// vm_wait_ready dispatches to IHyperVManager.WaitForReadyAsync with correct arguments.
-    /// See internal documentation — Readiness Probes.
-    /// </summary>
+    /// <summary>Readiness needs this call's identity and budget, not the legacy timeout-only overload.</summary>
     [Fact]
     public async Task VmWaitReady_Dispatches_To_HyperVManager_WaitForReadyAsync()
     {
         var expected = new VmInfo { VmId = TestVmGuid, Name = "test-vm", State = "Running", HostId = "local" };
-        _hvManager.Setup(m => m.WaitForReadyAsync("local", TestVmGuid, 300, It.IsAny<CancellationToken>()))
+        _hvManager.Setup(m => m.WaitForReadyAsync("local", TestVmGuid, It.IsAny<ReadinessBudget>(),
+                "readiness-user", "readiness-pass", It.IsAny<CancellationToken>()))
             .ReturnsAsync(expected);
 
         var dispatcher = CreateDispatcher();
@@ -489,7 +396,9 @@ public class P1ToolHandlerTests
             {
                 ["vmId"] = TestVmGuid,
                 ["hostId"] = "local",
-                ["timeoutSeconds"] = 300
+                ["timeoutSeconds"] = 300,
+                ["username"] = "readiness-user",
+                ["password"] = "readiness-pass"
             },
             CancellationToken.None);
 
@@ -497,43 +406,44 @@ public class P1ToolHandlerTests
         response.Should().NotBeNull();
         response!.Success.Should().BeTrue();
 
-        _hvManager.Verify(m => m.WaitForReadyAsync("local", TestVmGuid, 300, It.IsAny<CancellationToken>()), Times.Once,
-            "vm_wait_ready must delegate to IHyperVManager.WaitForReadyAsync with correct arguments");
+        _hvManager.Verify(m => m.WaitForReadyAsync("local", TestVmGuid,
+                It.Is<ReadinessBudget>(b => b.RequestedSeconds == 300),
+                "readiness-user", "readiness-pass", It.IsAny<CancellationToken>()), Times.Once,
+            "vm_wait_ready must delegate the resolved credentials and the tool-entry budget");
     }
 
-    /// <summary>
-    /// vm_wait_ready defaults timeout to 300 seconds when not provided.
-    /// </summary>
     [Fact]
     public async Task VmWaitReady_Default_Timeout_Is_300()
     {
         var expected = new VmInfo { VmId = TestVmGuid, Name = "test-vm", State = "Running", HostId = "local" };
-        _hvManager.Setup(m => m.WaitForReadyAsync("local", TestVmGuid, 300, It.IsAny<CancellationToken>()))
+        _hvManager.Setup(m => m.WaitForReadyAsync("local", TestVmGuid, It.IsAny<ReadinessBudget>(),
+                It.IsAny<string?>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(expected);
 
         var dispatcher = CreateDispatcher();
         var resultJson = await dispatcher.DispatchAsync("vm_wait_ready",
             new Dictionary<string, object?>
             {
-                ["vmId"] = TestVmGuid
-                // timeoutSeconds omitted — should default to 300
+                ["vmId"] = TestVmGuid,
+                ["username"] = "readiness-user",
+                ["password"] = "readiness-pass"
             },
             CancellationToken.None);
 
         var response = JsonSerializer.Deserialize<McpToolResponse>(resultJson);
         response!.Success.Should().BeTrue();
 
-        _hvManager.Verify(m => m.WaitForReadyAsync("local", TestVmGuid, 300, It.IsAny<CancellationToken>()), Times.Once,
-            "vm_wait_ready must default timeoutSeconds to 300 when not provided");
+        _hvManager.Verify(m => m.WaitForReadyAsync("local", TestVmGuid,
+                It.Is<ReadinessBudget>(b => b.RequestedSeconds == 300),
+                It.IsAny<string?>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()), Times.Once,
+            "vm_wait_ready must default the requested budget to 300 when not provided");
     }
 
-    /// <summary>
-    /// vm_wait_ready maps TimeoutException from service to an error response.
-    /// </summary>
     [Fact]
     public async Task VmWaitReady_Timeout_Returns_Error()
     {
-        _hvManager.Setup(m => m.WaitForReadyAsync("local", TestVmGuid, 10, It.IsAny<CancellationToken>()))
+        _hvManager.Setup(m => m.WaitForReadyAsync("local", TestVmGuid, It.IsAny<ReadinessBudget>(),
+                It.IsAny<string?>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
             .ThrowsAsync(new TimeoutException("VM did not become ready within 10 seconds."));
 
         var dispatcher = CreateDispatcher();
@@ -542,7 +452,9 @@ public class P1ToolHandlerTests
             {
                 ["vmId"] = TestVmGuid,
                 ["hostId"] = "local",
-                ["timeoutSeconds"] = 10
+                ["timeoutSeconds"] = 10,
+                ["username"] = "readiness-user",
+                ["password"] = "readiness-pass"
             },
             CancellationToken.None);
 
@@ -550,19 +462,11 @@ public class P1ToolHandlerTests
         response.Should().NotBeNull();
         response!.Success.Should().BeFalse(
             "TimeoutException must produce error response");
-        // TimeoutException maps through ErrorMapper — verify it produces a fail response
         response.Error.Should().NotBeNullOrWhiteSpace(
             "error message should be populated for timeout");
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // vm_checkpoint Tests
-    // ═══════════════════════════════════════════════════════════════════
 
-    /// <summary>
-    /// vm_checkpoint action="create" dispatches to ICheckpointManager.CreateCheckpointAsync.
-    /// See internal documentation — Checkpoint Workflow.
-    /// </summary>
     [Fact]
     public async Task VmCheckpoint_Create_Dispatches_Correctly()
     {
@@ -598,9 +502,6 @@ public class P1ToolHandlerTests
             "vm_checkpoint action=create must delegate to ICheckpointManager.CreateCheckpointAsync");
     }
 
-    /// <summary>
-    /// vm_checkpoint action="restore" dispatches to ICheckpointManager.RestoreCheckpointAsync.
-    /// </summary>
     [Fact]
     public async Task VmCheckpoint_Restore_Dispatches_Correctly()
     {
@@ -632,9 +533,6 @@ public class P1ToolHandlerTests
             "vm_checkpoint action=restore must delegate to ICheckpointManager.RestoreCheckpointAsync");
     }
 
-    /// <summary>
-    /// vm_checkpoint action="list" dispatches to ICheckpointManager.ListCheckpointsAsync.
-    /// </summary>
     [Fact]
     public async Task VmCheckpoint_List_Dispatches_Correctly()
     {
@@ -658,7 +556,6 @@ public class P1ToolHandlerTests
                 ["vmId"] = TestVmGuid,
                 ["action"] = "list",
                 ["hostId"] = "local"
-                // name not required for "list" action
             },
             CancellationToken.None);
 
@@ -670,9 +567,6 @@ public class P1ToolHandlerTests
             "vm_checkpoint action=list must delegate to ICheckpointManager.ListCheckpointsAsync");
     }
 
-    /// <summary>
-    /// vm_checkpoint action="delete" dispatches to ICheckpointManager.DeleteCheckpointAsync.
-    /// </summary>
     [Fact]
     public async Task VmCheckpoint_Delete_Dispatches_Correctly()
     {
@@ -704,9 +598,6 @@ public class P1ToolHandlerTests
             "vm_checkpoint action=delete must delegate to ICheckpointManager.DeleteCheckpointAsync");
     }
 
-    /// <summary>
-    /// vm_checkpoint with invalid action returns INVALID_PARAMETER.
-    /// </summary>
     [Fact]
     public async Task VmCheckpoint_InvalidAction_Returns_Error()
     {
@@ -727,9 +618,6 @@ public class P1ToolHandlerTests
             "invalid checkpoint action must map to INVALID_PARAMETER");
     }
 
-    /// <summary>
-    /// vm_checkpoint action="create" without required 'name' parameter returns INVALID_PARAMETER.
-    /// </summary>
     [Fact]
     public async Task VmCheckpoint_Create_MissingName_Returns_Error()
     {
@@ -739,7 +627,6 @@ public class P1ToolHandlerTests
             {
                 ["vmId"] = TestVmGuid,
                 ["action"] = "create"
-                // 'name' is missing — required for create
             },
             CancellationToken.None);
 
@@ -750,14 +637,7 @@ public class P1ToolHandlerTests
             "missing 'name' for create action must map to INVALID_PARAMETER");
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // vm_cleanup_orphans Tests
-    // ═══════════════════════════════════════════════════════════════════
 
-    /// <summary>
-    /// vm_cleanup_orphans with dryRun=true returns orphan list without destroying.
-    /// See internal documentation — Orphan Cleanup.
-    /// </summary>
     [Fact]
     public async Task VmCleanupOrphans_DryRun_Returns_OrphanList()
     {
@@ -786,9 +666,6 @@ public class P1ToolHandlerTests
             "vm_cleanup_orphans with dryRun=true must call CleanupOrphansAsync with dryRun=true");
     }
 
-    /// <summary>
-    /// vm_cleanup_orphans defaults dryRun to true when not provided.
-    /// </summary>
     [Fact]
     public async Task VmCleanupOrphans_Default_DryRun_Is_True()
     {
@@ -801,7 +678,6 @@ public class P1ToolHandlerTests
             new Dictionary<string, object?>
             {
                 ["hostId"] = "local"
-                // dryRun omitted — should default to true
             },
             CancellationToken.None);
 
@@ -812,15 +688,7 @@ public class P1ToolHandlerTests
             "vm_cleanup_orphans must default dryRun to true when not provided");
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // Lock Verification Tests
-    // ═══════════════════════════════════════════════════════════════════
 
-    /// <summary>
-    /// vm_checkpoint must acquire global + host + VM locks (lifecycle-grade operation).
-    /// Issue 1 fix: HandleCheckpointAsync now acquires all 3 lock levels per concurrency design.
-    /// See internal documentation — Operation Classification: vm_checkpoint needs Global+Host+VM.
-    /// </summary>
     [Fact]
     public async Task VmCheckpoint_Acquires_Global_Host_VM_Locks()
     {
@@ -843,7 +711,6 @@ public class P1ToolHandlerTests
             },
             CancellationToken.None);
 
-        // Verify all 3 lock levels were acquired
         _gate.Verify(g => g.AcquireGlobalSlotAsync(It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()), Times.Once,
             "vm_checkpoint must acquire global slot");
         _gate.Verify(g => g.AcquireHostLockAsync("local", It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()), Times.Once,
@@ -852,16 +719,13 @@ public class P1ToolHandlerTests
             "vm_checkpoint must acquire per-VM lock");
     }
 
-    /// <summary>
-    /// vm_wait_ready must acquire global + VM locks to prevent overlap with same-VM mutations.
-    /// Issue 2 fix: HandleWaitReadyAsync now acquires global + VM locks per concurrency design.
-    /// See internal documentation — Operation Classification: vm_wait_ready needs Global+VM.
-    /// </summary>
+    /// <summary>Global and VM locks prevent readiness from overlapping same-VM mutations.</summary>
     [Fact]
     public async Task VmWaitReady_Acquires_Global_And_VM_Locks()
     {
         var expected = new VmInfo { VmId = TestVmGuid, Name = "test-vm", State = "Running", HostId = "local" };
-        _hvManager.Setup(m => m.WaitForReadyAsync("local", TestVmGuid, 300, It.IsAny<CancellationToken>()))
+        _hvManager.Setup(m => m.WaitForReadyAsync("local", TestVmGuid, It.IsAny<ReadinessBudget>(),
+                It.IsAny<string?>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(expected);
 
         var dispatcher = CreateDispatcher();
@@ -869,17 +733,18 @@ public class P1ToolHandlerTests
             new Dictionary<string, object?>
             {
                 ["vmId"] = TestVmGuid,
-                ["hostId"] = "local"
+                ["hostId"] = "local",
+                ["username"] = "readiness-user",
+                ["password"] = "readiness-pass"
             },
             CancellationToken.None);
 
-        // Verify global + VM locks were acquired
         _gate.Verify(g => g.AcquireGlobalSlotAsync(It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()), Times.Once,
             "vm_wait_ready must acquire global slot");
         _gate.Verify(g => g.AcquireVmLockAsync("local", TestVmGuid, It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()), Times.Once,
             "vm_wait_ready must acquire per-VM lock to prevent overlap with same-VM mutations");
 
-        // Verify host lock is NOT acquired (wait_ready is not lifecycle-grade)
+        // Readiness is not lifecycle-grade, so it must not acquire the host lock.
         _gate.Verify(g => g.AcquireHostLockAsync(It.IsAny<string>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()), Times.Never,
             "vm_wait_ready should NOT acquire per-host lock (not a lifecycle operation)");
     }

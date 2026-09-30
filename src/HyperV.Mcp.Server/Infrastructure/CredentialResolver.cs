@@ -26,6 +26,12 @@ public static class CredentialResolver
     internal const string EnvVarPassword = "HYPERV_MCP_VM_PASSWORD";
 
     /// <summary>
+    /// Fixed-width replacement for every redacted representation. Its width is independent of
+    /// the password length, which is what keeps redacted output length-invariant (FR-9 item 5).
+    /// </summary>
+    internal const string RedactionMarker = "***REDACTED***";
+
+    /// <summary>
     /// Resolves credentials from tool parameters or environment variables.
     /// Both username AND password must be resolved; if either is missing, throws.
     /// </summary>
@@ -88,6 +94,44 @@ $cred = New-Object -TypeName System.Management.Automation.PSCredential -Argument
         if (string.IsNullOrEmpty(text) || string.IsNullOrEmpty(password))
             return text;
 
-        return text.Replace(password, "***REDACTED***");
+        return text.Replace(password, RedactionMarker);
+    }
+
+    /// <summary>
+    /// Removes every prohibited representation of <paramref name="password"/> — literal,
+    /// reversed, Base64, and URL-encoded. MUST run before the text is logged, spilled, or
+    /// embedded in an exception: the downstream passes match script-shaped patterns only
+    /// and cannot recognize an encoded secret.
+    /// See internal documentation — GCR-D4.
+    /// </summary>
+    /// <param name="text">The text that may contain a password representation.</param>
+    /// <param name="password">The password whose representations must be removed.</param>
+    /// <returns>The text with every prohibited representation replaced.</returns>
+    public static string RedactPasswordRepresentations(string text, string password)
+    {
+        if (string.IsNullOrEmpty(text) || string.IsNullOrEmpty(password))
+            return text;
+
+        var result = text;
+        foreach (var representation in ProhibitedRepresentations(password))
+        {
+            if (!string.IsNullOrEmpty(representation))
+            {
+                result = result.Replace(representation, RedactionMarker, StringComparison.Ordinal);
+            }
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// The FR-9 prohibited renderings of <paramref name="password"/>. Literal first, so a
+    /// rendering identical to it (e.g. URL-encoding an alphanumeric password) is already gone.
+    /// </summary>
+    internal static IEnumerable<string> ProhibitedRepresentations(string password)
+    {
+        yield return password;
+        yield return new string(password.Reverse().ToArray());
+        yield return Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(password));
+        yield return Uri.EscapeDataString(password);
     }
 }

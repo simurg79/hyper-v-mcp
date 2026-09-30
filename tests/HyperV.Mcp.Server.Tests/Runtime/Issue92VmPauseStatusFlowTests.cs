@@ -29,9 +29,12 @@ namespace HyperV.Mcp.Server.Tests.Runtime;
 ///
 /// These tests pin both invariants so they cannot regress unnoticed:
 ///
-///   • <see cref="PauseVmAsync_Script_InvokesSuspendVmNotSaveVm"/> captures
-///     the composed script and asserts <c>Suspend-VM</c> is present and
-///     <c>Save-VM</c> is absent. This is the bug-1 guard.
+///   • <see cref="PauseVmAsync_Script_InvokesInMemoryPauseNotSaveToDisk"/> captures
+///     the composed script and asserts the in-memory pause mechanism
+///     (WMI <c>RequestStateChange(9 = Quiesce)</c>, per
+///     internal documentation LF-D31) is present and BOTH
+///     save-to-disk verbs (<c>Save-VM</c> #92, <c>Suspend-VM</c> #267) are absent.
+///     This is the bug-1 guard, updated for the Option A pause mechanism.
 ///   • <see cref="GetVmStatusAsync_AlwaysQueriesLiveHost_NoCache"/> calls
 ///     status twice with two different mock payloads and asserts the executor
 ///     is invoked twice AND the second result reflects the second payload —
@@ -89,26 +92,28 @@ public class Issue92VmPauseStatusFlowTests
 
     /// <summary>
     /// Bug-1 regression guard: the script composed by <see cref="HyperVManager.PauseVmAsync"/>
-    /// must invoke <c>Suspend-VM</c> (in-memory freeze, fast transition to Paused)
-    /// and must NOT invoke <c>Save-VM</c> (which is the legacy bug from issue #92
-    /// that left VMs stuck in <c>Saving</c> for many seconds and looked like a
-    /// status caching bug to the reporter).
+    /// must drive an in-memory pause reaching <c>Paused</c> (6) and must NOT invoke a
+    /// save-to-disk verb. Issue #92 forbade <c>Save-VM</c>; issue #267 additionally forbids
+    /// <c>Suspend-VM</c> (also a save-to-disk verb whose terminal is <c>Saved</c>) in favor of
+    /// the WMI <c>RequestStateChange(9 = Quiesce)</c> mechanism, governed by
+    /// internal documentation LF-D31.
     ///
     /// We capture the composed script via Moq <c>Callback</c> rather than executing
     /// it (no live Hyper-V in unit tests). The mock returns a Paused VmInfo payload
     /// so the C# parser path also runs, but the assertion is purely on the script
-    /// content. See the internal issue tracker
+    /// content. See the internal issue tracker and
+    /// the internal issue tracker
     /// </summary>
     [Fact]
-    public async Task PauseVmAsync_Script_InvokesSuspendVmNotSaveVm()
+    public async Task PauseVmAsync_Script_InvokesInMemoryPauseNotSaveToDisk()
     {
         var (manager, exec) = BuildManager();
-        // Hyper-V State enum: 6 = Paused (mapped via VmStateMap in MapJsonToVmInfo).
+        // Get-VM projects State as its enum NAME; the parser consumes the name directly.
         var pausedJson = $$"""
         {
           "Id": "{{TestVmId}}",
           "Name": "test-vm",
-          "State": 6,
+          "State": "Paused",
           "ProcessorCount": 2,
           "MemoryMB": 2048,
           "UptimeSeconds": 60
@@ -126,17 +131,17 @@ public class Issue92VmPauseStatusFlowTests
         var info = await manager.PauseVmAsync(LocalHostId, TestVmId);
 
         info.State.Should().Be("Paused",
-            "the manager must surface the Hyper-V state-9 enum as the string 'Paused'.");
+            "the manager must surface the projected Get-VM state name 'Paused'.");
 
-        capturedScript.Should().Contain("Suspend-VM",
-            "vm_pause MUST compose a Suspend-VM call (in-memory freeze, fast transition). " +
-            "Issue #92 bug-1: the original implementation used Save-VM, which serializes " +
-            "guest state to disk and leaves the VM in 'Saving' for many seconds — visible " +
-            "to clients as an apparent status-cache bug.");
+        capturedScript.Should().Contain("RequestStateChange",
+            "vm_pause MUST drive an in-memory pause via the WMI " +
+            "Msvm_ComputerSystem.RequestStateChange(9 = Quiesce) request, which reaches " +
+            "Paused (6) rather than the save-to-disk Saved (5) terminal.");
         capturedScript.Should().NotContain("Save-VM",
-            "vm_pause MUST NOT invoke Save-VM. Save-VM is the issue #92 bug-1 regression " +
-            "trigger; reintroducing it will reproduce the multi-second 'Saving' window the " +
-            "reporter observed.");
+            "vm_pause MUST NOT invoke Save-VM (issue #92 bug-1; save-to-disk).");
+        capturedScript.Should().NotContain("Suspend-VM",
+            "vm_pause MUST NOT invoke Suspend-VM — it is also a save-to-disk verb whose " +
+            "documented terminal is Saved (5), the root cause of #267.");
     }
 
     /// <summary>
@@ -157,12 +162,11 @@ public class Issue92VmPauseStatusFlowTests
     public async Task GetVmStatusAsync_AlwaysQueriesLiveHost_NoCache()
     {
         var (manager, exec) = BuildManager();
-        // Hyper-V State enum: 2 = Running, 6 = Paused.
         var runningJson = $$"""
         {
           "Id": "{{TestVmId}}",
           "Name": "test-vm",
-          "State": 2,
+          "State": "Running",
           "ProcessorCount": 2,
           "MemoryMB": 2048,
           "UptimeSeconds": 30
@@ -172,7 +176,7 @@ public class Issue92VmPauseStatusFlowTests
         {
           "Id": "{{TestVmId}}",
           "Name": "test-vm",
-          "State": 6,
+          "State": "Paused",
           "ProcessorCount": 2,
           "MemoryMB": 2048,
           "UptimeSeconds": 60
