@@ -2,6 +2,8 @@
 
   <PropertyGroup>
     <TargetFramework>net8.0-windows</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <StartupObject>HyperV.Mcp.Server.Tests.Runtime.Issue392ProcessHarness</StartupObject>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
@@ -10,22 +12,35 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.7.0" />
+    <PackageReference Include="GitHubActionsTestLogger" Version="3.0.4" />
     <PackageReference Include="xunit" Version="2.9.3" />
     <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2">
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
+    <!-- MUST stay on 7.x: FluentAssertions 8.0.0+ moved to the Xceed Community License (non-commercial
+         free, commercial paid); 7.2.2 is the last Apache-2.0 release. Don't auto-bump to 8.x without a
+         licensing decision. Mirrors the Microsoft.PowerShell.SDK held-back pin in
+         ..\..\src\HyperV.Mcp.Server\HyperV.Mcp.Server.csproj. -->
     <PackageReference Include="FluentAssertions" Version="7.2.2" />
     <PackageReference Include="Moq" Version="4.20.72" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.9" />
+    <!-- Supplies FakeTimeProvider so readiness cadence is asserted on the same injected clock
+         production uses; a hand-rolled stub could not drive Task.Delay(TimeProvider). -->
+    <PackageReference Include="Microsoft.Extensions.TimeProvider.Testing" Version="8.10.0" />
     <PackageReference Include="System.ServiceProcess.ServiceController" Version="8.0.1" />
-    <!-- Provides the "GitHubActions" test logger used by the CI workflows
-         (.github/workflows/ci.yml and ci-hyperv.yml) for inline test annotations. -->
-    <PackageReference Include="GitHubActionsTestLogger" Version="3.0.4" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\HyperV.Mcp.Server\HyperV.Mcp.Server.csproj" />
   </ItemGroup>
+
+  <Target Name="RecordTestServerTargetPath" BeforeTargets="GetAssemblyAttributes" DependsOnTargets="ResolveProjectReferences">
+    <ItemGroup>
+      <AssemblyMetadata Include="TestServerTargetPath"
+                        Value="%(_ResolvedProjectReferencePaths.FullPath)"
+                        Condition="'%(_ResolvedProjectReferencePaths.Filename)' == 'HyperV.Mcp.Server'" />
+    </ItemGroup>
+  </Target>
 
 </Project>

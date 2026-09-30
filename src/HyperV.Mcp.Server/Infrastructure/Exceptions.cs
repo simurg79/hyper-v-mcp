@@ -1,9 +1,5 @@
 namespace HyperV.Mcp.Server.Infrastructure;
 
-/// <summary>
-/// Thrown when a VM is not found on the specified host.
-/// See /myplans/mcp-interface/mcp-interface-design.md — Error Code Taxonomy: VM_NOT_FOUND.
-/// </summary>
 public class VmNotFoundException : Exception
 {
     public string VmId { get; }
@@ -17,10 +13,7 @@ public class VmNotFoundException : Exception
     }
 }
 
-/// <summary>
-/// Thrown when a command times out during execution.
-/// See /myplans/execution/commands/commands-design.md — CMD-D4: Timeout returns success:false with partial output.
-/// </summary>
+/// <summary>Command timeout returns success:false with partial output.</summary>
 public class CommandTimeoutException : Exception
 {
     public string? PartialStdout { get; }
@@ -37,14 +30,8 @@ public class CommandTimeoutException : Exception
     }
 }
 
-/// <summary>
-/// Thrown when a VM already exists with the given name.
-/// See /myplans/mcp-interface/mcp-interface-design.md — Error Code Taxonomy: VM_ALREADY_EXISTS.
-/// Issue #203 / VC-DUP-D5 / Constraint #6: the message format is contractually pinned
-/// to <c>"A VM with the name '{name}' already exists on host '{hostId}'."</c> so
-/// smoke tests can assert string equality and PowerShell <c>throw</c> text never
-/// leaks onto the wire.
-/// </summary>
+/// <summary>VM_ALREADY_EXISTS keeps the exact constructor message for smoke-test equality
+/// and never exposes raw PowerShell throw text.</summary>
 public class VmAlreadyExistsException : Exception
 {
     public string VmName { get; }
@@ -65,15 +52,7 @@ public class VmAlreadyExistsException : Exception
     }
 }
 
-/// <summary>
-/// Thrown when a checkpoint operation (create, restore, remove) fails.
-/// Maps to CHECKPOINT_FAILED error code in the MCP error taxonomy.
-/// See /myplans/mcp-interface/mcp-interface-design.md — Error Code Taxonomy: CHECKPOINT_FAILED.
-/// See /myplans/vm-management/checkpoints/checkpoints-design.md — Checkpoint Workflow.
-///
-/// This is a dedicated exception type that ensures checkpoint failures map to
-/// CHECKPOINT_FAILED (not COMMAND_FAILED from InvalidOperationException).
-/// </summary>
+/// <summary>Maps checkpoint create/restore/remove failures to CHECKPOINT_FAILED, not generic COMMAND_FAILED.</summary>
 public class CheckpointFailedException : InvalidOperationException
 {
     public string VmId { get; }
@@ -100,7 +79,6 @@ public class CheckpointFailedException : InvalidOperationException
 /// <summary>
 /// Thrown when an ISO file is not found during OS installation.
 /// Maps to ISO_NOT_FOUND error code in the MCP error taxonomy.
-/// See /myplans/vm-management/iso-installation/iso-installation-design.md — Error Handling.
 /// </summary>
 public class IsoNotFoundException : InvalidOperationException
 {
@@ -116,7 +94,6 @@ public class IsoNotFoundException : InvalidOperationException
 /// <summary>
 /// Thrown when OS installation times out waiting for the guest to become ready.
 /// Maps to INSTALL_TIMEOUT error code in the MCP error taxonomy.
-/// See /myplans/vm-management/iso-installation/iso-installation-design.md — Error Handling.
 /// </summary>
 public class InstallTimeoutException : InvalidOperationException
 {
@@ -139,7 +116,6 @@ public class InstallTimeoutException : InvalidOperationException
 /// Thrown when OS installation fails (general installation failure).
 /// Maps to INSTALL_FAILED error code in the MCP error taxonomy.
 /// Preserves the VM — caller should NOT roll back after installation has started.
-/// See /myplans/vm-management/iso-installation/iso-installation-design.md — Rollback Policy.
 /// </summary>
 public class InstallFailedException : InvalidOperationException
 {
@@ -164,7 +140,6 @@ public class InstallFailedException : InvalidOperationException
 /// <summary>
 /// Thrown when the autounattend ISO creation or processing fails.
 /// Maps to AUTOUNATTEND_FAILED error code in the MCP error taxonomy.
-/// See /myplans/vm-management/iso-installation/iso-installation-design.md — Error Handling.
 /// </summary>
 public class AutounattendFailedException : InvalidOperationException
 {
@@ -175,19 +150,17 @@ public class AutounattendFailedException : InvalidOperationException
         : base(message, innerException) { }
 }
 
-/// <summary>
-/// Thrown when an ISO supplied to <c>vm_os_install</c> is not a Windows installer
-/// (does not contain <c>sources\install.wim</c>). Maps to
-/// <c>OS_NOT_SUPPORTED</c> in the MCP error taxonomy.
-/// Issue #97; ISO-D16 (always enforced; not bypassable by <c>skipPreflight</c>).
-/// See /myplans/vm-management/iso-installation/iso-installation-design.md — ISO-D16.
-/// </summary>
+/// <summary>ISO lacks sources\install.wim; maps to OS_NOT_SUPPORTED.
+/// The media check is mandatory even with skipPreflight.</summary>
 public class OsNotSupportedException : InvalidOperationException
 {
     public string IsoPath { get; }
 
+    // Fixed text names both supported targets without exposing internal tokens, caller paths or secrets; OS_NOT_SUPPORTED stays unchanged.
     public OsNotSupportedException(string isoPath)
-        : base("vm_os_install currently supports Windows ISOs only (sources\\install.wim required). See ISO-D16.")
+        : base("Unsupported installation media. vm_os_install supports Windows (ISO with " +
+               "sources\\install.wim) and Ubuntu Server 24.04 (ISO with a casper/ live-installer " +
+               "layout). The supplied ISO matched neither.")
     {
         IsoPath = isoPath;
     }
@@ -199,16 +172,101 @@ public class OsNotSupportedException : InvalidOperationException
     }
 }
 
-/// <summary>
-/// Thrown when <c>vm_os_install</c>'s C#-side resource-floor preflight fails:
-/// <c>cpuCount &lt; 2</c>, <c>memoryMB &lt; 4096</c>, or <c>diskSizeGB &lt; 64</c>.
-/// Maps to <c>INSUFFICIENT_RESOURCES</c> in the MCP error taxonomy. The
-/// <see cref="FailedFloor"/>, <see cref="Minimum"/>, and <see cref="Actual"/>
-/// values are surfaced via the response envelope's <c>data</c> field so
-/// callers can react programmatically.
-/// Issue #97; ISO-D17 (bypassable via <c>skipPreflight=true</c>).
-/// See /myplans/vm-management/iso-installation/iso-installation-design.md — ISO-D17.
-/// </summary>
+/// <summary> Thrown when an Ubuntu Server 24.04 install does not publish its completion KVP
+/// (<c>hyperv-mcp/os-install</c>) within <c>timeoutMinutes</c>. Maps to <c>LINUX_INSTALL_TIMEOUT</c>; preserves
+/// the VM for inspection. Linux analogue of <see cref="InstallTimeoutException"/>, kept distinct so the Windows
+/// timeout code is unchanged. </summary>
+public class LinuxInstallTimeoutException : InvalidOperationException
+{
+    public int TimeoutMinutes { get; }
+    public string? VmId { get; }
+    public string? VmName { get; }
+
+    /// <summary>Observed primary-DVD media distinguishes wrong media from missing completion signal.
+    /// Null if unreadable; never substitute the requested path, which would assume the fact being investigated.</summary>
+    public string? AttachedIsoPath { get; }
+
+    /// <summary>
+    /// Observed guest completion channel state; Undetermined is reported, not hidden.
+    /// .
+    /// </summary>
+    public GuestCompletionChannelState ChannelState { get; }
+
+    public LinuxInstallTimeoutException(
+        string message,
+        int timeoutMinutes,
+        string? vmId = null,
+        string? vmName = null,
+        string? attachedIsoPath = null,
+        GuestCompletionChannelState channelState = GuestCompletionChannelState.Undetermined)
+        : base(message)
+    {
+        TimeoutMinutes = timeoutMinutes;
+        VmId = vmId;
+        VmName = vmName;
+        AttachedIsoPath = attachedIsoPath;
+        ChannelState = channelState;
+    }
+}
+
+/// <summary> Thrown when Ubuntu cloud-init autoinstall reports a terminal provisioning failure (a <c>failed:*</c>
+/// KVP) or an observable error before the ready signal. Maps to <c>LINUX_PROVISION_FAILED</c> and preserves the
+/// VM for inspection. Linux analogue of <see cref="InstallFailedException"/>. </summary>
+public class LinuxProvisionFailedException : InvalidOperationException
+{
+    public string? VmId { get; }
+    public string? VmName { get; }
+
+    /// <summary>Required stable step identifier (e.g. seed-media-build or vm-create) prevents step-less LINUX_PROVISION_FAILED errors.</summary>
+    public string FailingStep { get; }
+
+    /// <summary>Sanitized, capped underlying cause text; null when the step reported none.</summary>
+    public string? Cause { get; }
+
+    /// <summary>True when <see cref="Cause"/> was capped, so truncation is disclosed not silent.</summary>
+    public bool CauseTruncated { get; }
+
+    /// <summary>
+    /// Which tool authored the media, when the failing step is media authoring. Host-side
+    /// diagnostic only — it MUST NOT be projected into the caller envelope.
+    /// </summary>
+    public string? AuthoringRoute { get; }
+
+    public LinuxProvisionFailedException(
+        string message,
+        string failingStep,
+        string? vmId = null,
+        string? vmName = null,
+        string? cause = null,
+        bool causeTruncated = false,
+        string? authoringRoute = null)
+        : base(message)
+    {
+
+        if (string.IsNullOrWhiteSpace(failingStep))
+            throw new ArgumentException("A failing step is required.", nameof(failingStep));
+
+        FailingStep = failingStep;
+        VmId = vmId;
+        VmName = vmName;
+        Cause = cause;
+        CauseTruncated = causeTruncated;
+        AuthoringRoute = authoringRoute;
+    }
+}
+
+/// <summary> Thrown when the Ubuntu Generation-2 / Secure-Boot-off precondition is not met because the caller
+/// explicitly requested an incompatible firmware/generation. Maps to <c>LINUX_PRECONDITION_UNMET</c>. Synchronous
+/// fail-fast before any VM or job — same family as <see cref="OsNotSupportedException"/>. Fixed message, no
+/// caller paths or secrets. </summary>
+public class LinuxPreconditionUnmetException : InvalidOperationException
+{
+    public LinuxPreconditionUnmetException(string message)
+        : base(message) { }
+}
+
+/// <summary>Resource floors are cpuCount < 2, memoryMB < 4096 or diskSizeGB < 64; skipPreflight=true bypasses them.
+/// Maps to INSUFFICIENT_RESOURCES, with FailedFloor/Minimum/Actual in response data so callers can adjust requests.</summary>
 public class InsufficientResourcesException : InvalidOperationException
 {
     /// <summary>Name of the violated floor: <c>cpuCount</c>, <c>memoryMB</c>, or <c>diskSizeGB</c>.</summary>
@@ -232,7 +290,7 @@ public class InsufficientResourcesException : InvalidOperationException
 /// <summary>
 /// Thrown when a VM is not in the Running state and a command/script/file-transfer is attempted.
 /// Maps to VM_NOT_RUNNING error code in the MCP error taxonomy.
-/// See GitHub Issue #21.
+/// See GitHub.
 /// </summary>
 public class VmNotRunningException : Exception
 {
@@ -252,8 +310,7 @@ public class VmNotRunningException : Exception
 /// <summary>
 /// Thrown when VM credentials cannot be resolved from tool parameters or environment variables.
 /// Maps to MISSING_CREDENTIALS error code in the MCP error taxonomy.
-/// See /myplans/security/credentials/credentials-design.md — Phase 1: Minimal Credential Resolution.
-/// See GitHub Issue #20.
+/// See GitHub.
 /// </summary>
 public class MissingCredentialsException : Exception
 {
@@ -261,15 +318,10 @@ public class MissingCredentialsException : Exception
         : base("No credentials provided. Supply username/password as tool parameters or set HYPERV_MCP_VM_USERNAME and HYPERV_MCP_VM_PASSWORD environment variables.") { }
 }
 
-/// <summary>
-/// Thrown when a configured filesystem path exists but cannot be read, enumerated,
-/// or written due to permissions, locking, or other I/O failure. Maps to
-/// <c>IO_ERROR</c> in the MCP error taxonomy. Distinct from
-/// <see cref="FileNotFoundException"/> (specific source artifact missing) and
-/// from validation/missing-config failures (which use <c>INVALID_PARAMETER</c>).
-/// See /myplans/vm-management/storage/storage-design.md — ST-D7.
-/// See /myplans/mcp-interface/mcp-interface-design.md — Error Code Taxonomy: IO_ERROR.
-/// </summary>
+/// <summary> Thrown when a configured filesystem path exists but cannot be read, enumerated, or written due to
+/// permissions, locking, or other I/O failure. Maps to <c>IO_ERROR</c> in the MCP error taxonomy. Distinct from
+/// <see cref="FileNotFoundException"/> (specific source artifact missing) and from validation/missing-config
+/// failures (which use <c>INVALID_PARAMETER</c>). </summary>
 public class IoOperationFailedException : Exception
 {
     public string Path { get; }
@@ -287,13 +339,10 @@ public class IoOperationFailedException : Exception
     }
 }
 
-/// <summary>
-/// Issue #51 / CP-D6: Thrown by <see cref="ICheckpointManager.MergeAllAsync"/> when the
-/// checkpoint tree topology is not a linear chain (e.g. branched trees, multiple
-/// children). Maps to <c>MERGE_NOT_SUPPORTED</c> in the MCP error taxonomy.
-/// Distinct from <see cref="CheckpointMergeFailedException"/> which represents a
-/// runtime failure of an attempted merge.
-/// </summary>
+/// <summary> Thrown by <see cref="ICheckpointManager.MergeAllAsync"/> when the checkpoint tree topology is not a
+/// linear chain (e.g. branched trees, multiple children). Maps to <c>MERGE_NOT_SUPPORTED</c> in the MCP error
+/// taxonomy. Distinct from <see cref="CheckpointMergeFailedException"/> which represents a runtime failure of an
+/// attempted merge. </summary>
 public class MergeNotSupportedException : InvalidOperationException
 {
     public string VmId { get; }
@@ -307,15 +356,8 @@ public class MergeNotSupportedException : InvalidOperationException
     }
 }
 
-/// <summary>
-/// Issue #51 / CP-D6: Thrown by <see cref="ICheckpointManager.MergeAllAsync"/> when a
-/// linear-chain merge was attempted but the underlying Hyper-V merge job failed
-/// (I/O error, locked VHDX, transient Hyper-V failure, etc.). Maps to
-/// <c>CHECKPOINT_MERGE_FAILED</c> in the MCP error taxonomy. Distinct from
-/// <see cref="CheckpointFailedException"/> which covers create/restore/list/delete
-/// failures, and from <see cref="MergeNotSupportedException"/> which is a topology
-/// pre-condition rejection.
-/// </summary>
+/// <summary>MergeAllAsync attempted a linear merge but Hyper-V failed (I/O, locked VHDX or transient failure): CHECKPOINT_MERGE_FAILED.
+/// Distinct from topology rejection (MergeNotSupportedException) and create/restore/list/delete failure (CheckpointFailedException).</summary>
 public class CheckpointMergeFailedException : InvalidOperationException
 {
     public string VmId { get; }
@@ -336,12 +378,9 @@ public class CheckpointMergeFailedException : InvalidOperationException
     }
 }
 
-/// <summary>
-/// Issue #51: Thrown by <c>vm_create_base_image</c> when the in-guest
-/// <c>sysprep /generalize /oobe /shutdown</c> step did not succeed: the in-guest
-/// invocation failed, or the VM failed to reach <c>Off</c> within
-/// <c>shutdownTimeoutSeconds</c>. Maps to <c>SYSPREP_FAILED</c>.
-/// </summary>
+/// <summary> Thrown by <c>vm_create_base_image</c> when the in-guest <c>sysprep /generalize /oobe /shutdown</c>
+/// step did not succeed: the in-guest invocation failed, or the VM failed to reach <c>Off</c> within
+/// <c>shutdownTimeoutSeconds</c>. Maps to <c>SYSPREP_FAILED</c>. </summary>
 public class SysprepFailedException : InvalidOperationException
 {
     public string VmId { get; }
@@ -362,13 +401,10 @@ public class SysprepFailedException : InvalidOperationException
     }
 }
 
-/// <summary>
-/// Issue #51: Thrown by <c>vm_create_base_image</c> when the host-side
-/// <see cref="System.IO.File.Copy(string, string, bool)"/> of the VM's primary VHDX
-/// into the configured image directory fails. Causes: <c>ServerOptions.ImageDirectory</c>
-/// not configured, destination file already exists, source missing, or IO/permission error.
-/// Maps to <c>IMAGE_COPY_FAILED</c>.
-/// </summary>
+/// <summary> Thrown by <c>vm_create_base_image</c> when the host-side <see cref="System.IO.File.Copy(string,
+/// string, bool)"/> of the VM's primary VHDX into the configured image directory fails. Causes:
+/// <c>ServerOptions.ImageDirectory</c> not configured, destination file already exists, source missing, or
+/// IO/permission error. Maps to <c>IMAGE_COPY_FAILED</c>. </summary>
 public class ImageCopyFailedException : InvalidOperationException
 {
     /// <summary>Source path on the host (may be <c>null</c> when source could not be resolved).</summary>
@@ -392,23 +428,9 @@ public class ImageCopyFailedException : InvalidOperationException
     }
 }
 
-/// <summary>
-/// Issue #164 / LF-D17: thrown by <c>HyperVManager.CreateVmAsync</c> when the primary
-/// create pipeline fails (or the inbound CT is cancelled) AND the detached-CTS
-/// rollback has been awaited. Carries the structured details block that LF-D17
-/// requires in the MCP error envelope:
-/// <c>{ vmName, phase, rollback: { performed, succeeded, elapsedMs, residualArtifacts } }</c>.
-///
-/// <para>The mapped error code is decided by <see cref="ErrorCode"/> rather than by
-/// exception type:</para>
-/// <list type="bullet">
-/// <item><c>OPERATION_CANCELED</c> — inbound CT was signalled.</item>
-/// <item><c>COMMAND_TIMEOUT</c> — PowerShell child timed out (TimedOut=true).</item>
-/// <item><c>COMMAND_FAILED</c> — any other create-pipeline failure.</item>
-/// </list>
-///
-/// See /myplans/vm-management/lifecycle/lifecycle-design.md — LF-D17.
-/// </summary>
+/// <summary>Create failed or was cancelled after detached-token rollback was awaited; carries
+/// { vmName, phase, rollback: { performed, succeeded, elapsedMs, residualArtifacts } } in error details.
+/// ErrorCode selects OPERATION_CANCELED for caller cancellation, COMMAND_TIMEOUT for child timeout, otherwise COMMAND_FAILED.</summary>
 public class VmCreateRollbackException : Exception
 {
     /// <summary>VM name that the failed <c>vm_create</c> targeted.</summary>
@@ -417,7 +439,7 @@ public class VmCreateRollbackException : Exception
     /// <summary>Final error code the envelope should carry.</summary>
     public string ErrorCode { get; }
 
-    /// <summary>Last successful create-pipeline phase before failure (LF-D17 enum).</summary>
+    /// <summary>Last successful create-pipeline phase before failure ( enum).</summary>
     public string Phase { get; }
 
     /// <summary>Structured rollback result. Always non-null — rollback is always attempted.</summary>
@@ -439,12 +461,8 @@ public class VmCreateRollbackException : Exception
     }
 }
 
-/// <summary>
-/// Outcome of the LF-D17 cancellation-safe rollback. Serialized into
-/// <c>McpToolResponse.Details.rollback</c>.
-/// AC#2 ("no orphan VHDX") is satisfied iff
-/// <see cref="ResidualArtifacts"/> is empty.
-/// </summary>
+/// <summary>Cancellation-safe rollback outcome serialized into McpToolResponse.Details.rollback.
+/// No orphan VHDX means ResidualArtifacts is empty.</summary>
 public class VmCreateRollbackInfo
 {
     public bool Performed { get; init; }
@@ -453,16 +471,8 @@ public class VmCreateRollbackInfo
     public IReadOnlyList<string> ResidualArtifacts { get; init; } = Array.Empty<string>();
 }
 
-/// Issue #204 / VC-DEST-D2 / VC-DEST-D3: Thrown by
-/// <see cref="FileTransferService.CopyFileToGuestAsync"/> when the guest-side
-/// ensure-parent step (auto-create of the destination's parent directory) fails
-/// — e.g. ACL denial, read-only volume, invalid drive, or quota exhaustion.
-/// Maps to <c>DEST_DIR_MISSING</c> ("missing or not creatable") in the MCP error
-/// taxonomy via <see cref="ErrorMapper.MapException"/> type-match (not substring),
-/// so callers can distinguish a missing/uncreatable destination parent from a
-/// missing source file (which remains <c>FILE_NOT_FOUND</c>, Issue #38 contract).
-/// See /myplans/execution/file-transfer/vm-copy-file-dest-dir-design.md — VC-DEST-D1..D8.
-/// </summary>
+/// <summary>Guest destination-parent creation failed (ACL, read-only volume, invalid drive or quota): DEST_DIR_MISSING.
+/// ErrorMapper uses the exception type, not message substrings, to distinguish an uncreatable parent from a missing source (FILE_NOT_FOUND).</summary>
 internal sealed class DestinationDirectoryUnavailableException : Exception
 {
     /// <summary>The caller-supplied destination path (verbatim, not the parent).</summary>
@@ -475,35 +485,224 @@ internal sealed class DestinationDirectoryUnavailableException : Exception
     }
 }
 
-/// <summary>
-/// Issue #209 (sub-finding) / VC-SO-D2: Thrown by <see cref="SessionStore"/> when
-/// <c>New-PSSession</c> fails to open a PowerShell Direct session against a guest
-/// VM (notably Linux guests where the hypervisor socket negotiation fails with
-/// <c>PSSessionOpenFailed</c> / <c>vmhypervsocketclient</c> errors).
-///
-/// <para>Derives from <see cref="InvalidOperationException"/> (not
-/// <see cref="Exception"/>) to preserve backward compatibility with existing
-/// <c>SessionStoreTests.GetOrCreateAsync_NewPSSessionThrows_*</c> and
-/// <c>GetOrCreateAsync_EmptyExceptionMessage_*</c> tests which assert
-/// <c>InvalidOperationException</c> via <c>Assert.ThrowsAsync</c> /
-/// <c>Should().ThrowAsync</c>. C5 backward-compat lock.</para>
-///
-/// <para>Maps to <c>SESSION_FAILED</c> via the typed arm in
-/// <see cref="ErrorMapper"/> (VC-SO-D3) placed ABOVE the path-not-found
-/// substring arm to prevent the prior misclassification as
-/// <c>FILE_NOT_FOUND</c> on <c>vm_copy_file</c> Linux failures.</para>
-///
-/// See /myplans/remoting/session-management/psdirect-linux-session-open-classification-design.md.
-/// </summary>
+/// <summary>SessionStore could not open PowerShell Direct, including Linux PSSessionOpenFailed/vmhypervsocketclient failures.
+/// InvalidOperationException inheritance preserves existing test contracts. The typed SESSION_FAILED mapper arm must precede
+/// path-not-found matching to prevent Linux copy failures being mislabeled FILE_NOT_FOUND.</summary>
 public class SessionOpenFailedException : InvalidOperationException
 {
     public string SessionName { get; }
     public string VmId { get; }
 
-    public SessionOpenFailedException(string sessionName, string vmId, string message, Exception? innerException = null)
+    /// <summary>
+    /// True only when the throw site recognized the guest as refusing the supplied credential.
+    /// Defaults to <c>false</c> so an unrecognized signal falls through to the generic
+    /// <c>SESSION_FAILED</c> arm rather than guessing an authentication verdict.
+    /// </summary>
+    public bool CredentialRejected { get; }
+
+    /// <summary>
+    /// Attempted username. Non-secret, surfaced in the caller-facing message; never
+    /// accompanied by the password.
+    /// </summary>
+    public string? Username { get; }
+
+    /// <summary>Server-side stderr spill identifier lets the bounded envelope point to omitted diagnostic detail.</summary>
+    public string? SpillSummary { get; }
+
+    /// <summary>Capture the cause structurally at the throw site; bounding preserves it verbatim regardless of position,
+    /// rather than trying to recover it from head/tail-truncated prose.</summary>
+    public string? DecisiveCause { get; }
+
+    public SessionOpenFailedException(
+        string sessionName,
+        string vmId,
+        string message,
+        Exception? innerException = null,
+        bool credentialRejected = false,
+        string? username = null,
+        string? spillSummary = null,
+        string? decisiveCause = null)
         : base(message, innerException)
     {
         SessionName = sessionName;
         VmId = vmId;
+        CredentialRejected = credentialRejected;
+        Username = username;
+        SpillSummary = spillSummary;
+        DecisiveCause = decisiveCause;
+    }
+}
+
+/// <summary>Linux SSH connection/session-open failure maps to SESSION_FAILED, like PowerShell Direct.
+/// A non-zero remote exit instead returns CommandResult. Redact credentials before construction; never embed SSH keys or private-key material.</summary>
+public class SshSessionOpenException : InvalidOperationException
+{
+    public string VmId { get; }
+
+    /// <summary>
+    /// Identifier of the server-side stderr spill holding the full diagnostic text, so the SSH
+    /// leg has the same referent as the PSDirect leg.
+    /// </summary>
+    public string? SpillSummary { get; }
+
+    /// <summary>
+    /// The nested-cause text, already redacted with the actual request password while it was
+    /// still in scope. Consumers MUST read this instead of walking <see cref="Exception.InnerException"/>:
+    /// the mapper has no password and therefore cannot remove an encoded secret from a raw chain.
+    /// </summary>
+    public string? RedactedCauseChain { get; }
+
+    /// <summary>
+    /// The cause statement as known at the throw site (SSH.NET states it in the innermost
+    /// exception), already redacted. Reproduced verbatim by the bounding pass irrespective of
+    /// its position in the flattened text.
+    /// </summary>
+    public string? DecisiveCause { get; }
+
+    public SshSessionOpenException(
+        string vmId,
+        string message,
+        Exception? innerException = null,
+        string? spillSummary = null,
+        string? redactedCauseChain = null,
+        string? decisiveCause = null)
+        : base(message, innerException)
+    {
+        VmId = vmId;
+        SpillSummary = spillSummary;
+        RedactedCauseChain = redactedCauseChain;
+        DecisiveCause = decisiveCause;
+    }
+}
+
+/// <summary>Guest transfer failed without denial, missing path or connection loss. IOException preserves TRANSFER_FAILED;
+/// the typed mapper forwards the composed direction/VM/path message instead of generic I/O text.</summary>
+public class GuestTransferFailedException : IOException
+{
+    /// <summary>True only when the message already carries direction, VM and failing path and must be forwarded unchanged.
+    /// Explicit state avoids prefix-matching inner errors that omit VM context and would suppress the needed outer wrapper.</summary>
+    public bool CarriesCallerContext { get; init; }
+
+    public GuestTransferFailedException(string message, Exception? innerException = null)
+        : base(message, innerException)
+    {
+    }
+}
+
+/// <summary>Guest denial retains AUTH_FAILED through UnauthorizedAccessException inheritance but forwards composed direction/VM/path text.
+/// A separate type avoids exposing unproven-safe host image/VHDX messages from the shared UnauthorizedAccessException arm.</summary>
+public class GuestTransferAccessDeniedException : UnauthorizedAccessException
+{
+    public GuestTransferAccessDeniedException(string message, Exception? innerException = null)
+        : base(message, innerException)
+    {
+    }
+}
+
+/// <summary>
+/// A guest file transfer targeted a path that does not exist. Extends
+/// <see cref="FileNotFoundException"/> so it still classifies as <c>FILE_NOT_FOUND</c>, typed for
+/// the same reason as <see cref="GuestTransferAccessDeniedException"/>.
+/// </summary>
+public class GuestTransferPathNotFoundException : FileNotFoundException
+{
+    public GuestTransferPathNotFoundException(
+        string message, string? fileName = null, Exception? innerException = null)
+        : base(message, fileName, innerException)
+    {
+    }
+}
+
+/// <summary>SSH/SFTP connection establishment or loss is a session fault (SESSION_FAILED), not a transfer fault.
+/// Discard the cached client so the next call reconnects; both cases share handling.</summary>
+public class GuestConnectionLostException : InvalidOperationException
+{
+    /// <summary>True when this message already names direction, VM, and failing path.</summary>
+    public bool CarriesCallerContext { get; init; }
+
+    public GuestConnectionLostException(string message, Exception? innerException = null)
+        : base(message, innerException)
+    {
+    }
+}
+
+/// <summary>Known-Linux without usable SSH, or undetermined guest OS, prevents transport selection: SESSION_FAILED.
+/// Thrown synchronously to reach ErrorMapper. Distinguish the conditions by message and router log marker, never by error code.</summary>
+public class GuestRoutingUnavailableException : InvalidOperationException
+{
+    public string VmId { get; }
+
+    public GuestRoutingUnavailableException(string vmId, string message)
+        : base(message)
+    {
+        VmId = vmId;
+    }
+}
+
+/// <summary>Password-bearing creation rejects non-generalized or indeterminate base images before artifacts exist; no rollback is needed.
+/// The typed mapper arm must precede generic InvalidOperationException or this becomes COMMAND_FAILED.</summary>
+public class BaseImageNotGeneralizedException : InvalidOperationException
+{
+    /// <summary>True when the verdict was "could not be confirmed" rather than a clean negative.</summary>
+    public bool Indeterminate { get; }
+
+    public BaseImageNotGeneralizedException(string message, bool indeterminate)
+        : base(message)
+    {
+        Indeterminate = indeterminate;
+    }
+}
+
+/// <summary>
+/// One shared vocabulary for the <c>vm_pause</c> settle script, the sentinel crossing the
+/// PowerShell seam, and the caller-visible <c>details.pauseOutcome</c>, so no alternative spelling
+/// can appear at any of those three points.
+/// </summary>
+public static class PauseOutcomes
+{
+    public const string SettledPaused = "settled_paused";
+    public const string ConflictingTerminalState = "conflicting_terminal_state";
+    public const string WaitExhausted = "wait_exhausted";
+
+    /// <summary>Prefix the manager searches for anywhere in a failure message.</summary>
+    public const string SentinelPrefix = "vm_pause:";
+}
+
+/// <summary>Typed pause failure carries outcome/state details that a generic PowerShell throw would lose as COMMAND_FAILED.
+/// Only PauseOutcome classifies; exhausted waits and genuine conflicts can share ObservedState.
+/// The typed mapper arm must precede generic InvalidOperationException.</summary>
+public class VmStateConflictException : InvalidOperationException
+{
+    /// <summary>Exactly <c>conflicting_terminal_state</c> or <c>wait_exhausted</c>.</summary>
+    public string PauseOutcome { get; }
+
+    /// <summary>The <c>Get-VM</c> state token read at abandon.</summary>
+    public string ObservedState { get; }
+
+    public VmStateConflictException(string pauseOutcome, string observedState, string message)
+        : base(message)
+    {
+        PauseOutcome = pauseOutcome;
+        ObservedState = observedState;
+    }
+}
+
+/// <summary>Guest-login readiness was not confirmed; the VM remains available for inspection.</summary>
+public class ReadinessNotReachedException : InvalidOperationException
+{
+    /// <summary>Name of the preserved VM.</summary>
+    public string VmName { get; }
+
+    /// <summary>
+    /// False when the guest-delivery answer file could not be confirmed deleted, which downgrades
+    /// the caller-facing outcome.
+    /// </summary>
+    public bool ArtifactScrubbed { get; }
+
+    public ReadinessNotReachedException(string vmName, string message, bool artifactScrubbed)
+        : base(message)
+    {
+        VmName = vmName;
+        ArtifactScrubbed = artifactScrubbed;
     }
 }

@@ -2,7 +2,7 @@
 
 ## Overview
 
-This test suite defines the **expected MCP behavior contract** for the Hyper-V MCP Server using a **test-first** approach. Tests are written _before_ implementation to codify the design decisions captured in the project's internal design notes.
+This test suite defines the **expected MCP behavior contract** for the Hyper-V MCP Server using a **test-first** approach. Tests are written _before_ implementation to codify the design decisions from the [design documents](/myplans/design.md).
 
 ## Test Structure
 
@@ -31,6 +31,15 @@ tests/HyperV.Mcp.Server.Tests/
 ```bash
 # Run all tests and see the authoritative count
 dotnet test --verbosity normal
+```
+
+`dotnet test` also runs the Python suite for the Ubuntu autoinstall ISO
+preparation helper: [`Runtime/Issue358PreparationHelperPythonSuiteTests.cs`](Runtime/Issue358PreparationHelperPythonSuiteTests.cs)
+shells out to `scripts/test_prepare_ubuntu_autoinstall_iso.py`. It can also be
+run directly:
+
+```bash
+python scripts/test_prepare_ubuntu_autoinstall_iso.py
 ```
 
 > **Note:** Test counts below are intentionally omitted to avoid documentation drift.
@@ -67,7 +76,19 @@ Runtime tests exercise real implementations of `ToolDispatcher`, `HostResolver`,
 
 ## Key Design References
 
-Each test file's doc comments cite the specific internal design-doc sections (MCP-D*, CC-D*, CMD-D*, and so on) that the test pins. Those design documents are maintained in a separate internal vault and are not part of this public repository; the test source itself is the authoritative behavior contract.
+| Test File | Primary Design Docs |
+|-----------|-------------------|
+| `ToolDiscoveryTests.cs` | [/myplans/mcp-interface/mcp-interface-design.md](/myplans/mcp-interface/mcp-interface-design.md) — Complete Tool Catalog |
+| `ErrorEnvelopeTests.cs` | [/myplans/mcp-interface/mcp-interface-design.md](/myplans/mcp-interface/mcp-interface-design.md) — MCP-D2, ADR-8, Error Code Taxonomy |
+| `RemotingContractTests.cs` | [/myplans/remoting/remoting-design.md](/myplans/remoting/remoting-design.md) — MCP-D3, Host Connection Configuration |
+| `ConcurrencyTests.cs` | [/myplans/operational/concurrency/concurrency-design.md](/myplans/operational/concurrency/concurrency-design.md) — CC-D1 through CC-D7 |
+| `ToolDispatchTests.cs` | [/myplans/mcp-interface/mcp-interface-design.md](/myplans/mcp-interface/mcp-interface-design.md) — MCP-D1, MCP-D6 |
+| `HostResolutionTests.cs` | [/myplans/remoting/remoting-design.md](/myplans/remoting/remoting-design.md) — Host Connection Configuration |
+| `ConcurrencyGateRuntimeTests.cs` | [/myplans/operational/concurrency/concurrency-design.md](/myplans/operational/concurrency/concurrency-design.md) — CC-D1 through CC-D4 |
+| `ErrorMappingRuntimeTests.cs` | [/myplans/mcp-interface/mcp-interface-design.md](/myplans/mcp-interface/mcp-interface-design.md) — MCP-D6, Error Code Taxonomy |
+| `TimeoutBehaviorTests.cs` | [/myplans/execution/commands/commands-design.md](/myplans/execution/commands/commands-design.md) — CMD-D4, ADR-9 |
+| `VmLifecycleFlowTests.cs` | [/myplans/vm-management/vm-management-design.md](/myplans/vm-management/vm-management-design.md) — Capability Matrix |
+| `CheckpointFileTransferRemotingFlowTests.cs` | [/myplans/vm-management/checkpoints/checkpoints-design.md](/myplans/vm-management/checkpoints/checkpoints-design.md), [/myplans/execution/file-transfer/file-transfer-design.md](/myplans/execution/file-transfer/file-transfer-design.md) |
 
 ## Conventions
 

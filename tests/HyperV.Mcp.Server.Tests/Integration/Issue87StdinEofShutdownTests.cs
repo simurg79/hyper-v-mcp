@@ -1,35 +1,14 @@
 using System.Diagnostics;
 using System.Text;
 using FluentAssertions;
+using HyperV.Mcp.Server.Tests.TestSupport;
 using Xunit;
 using Xunit.Abstractions;
 
 namespace HyperV.Mcp.Server.Tests.Integration;
 
-/// <summary>
-/// Regression tests for Issue #87 — server must exit cleanly within the
-/// watchdog grace period after the MCP SDK transport observes stdin EOF,
-/// while remaining alive as long as stdin stays open.
-///
-/// <para>
-/// Contract enforced (MCP-D12):
-/// </para>
-/// <list type="bullet">
-///   <item>(a) When stdin is closed, the server process exits with code 0
-///   well within the 5s grace period (we allow up to 10s here for slow CI).</item>
-///   <item>(b) While stdin remains open, the server stays alive past a
-///   readiness wait + ~2s idle window — i.e. the watchdog is not a
-///   false-positive on a still-open pipe.</item>
-/// </list>
-///
-/// <para>
-/// The spawn / readiness / exe-resolution pattern mirrors
-/// <see cref="McpStdioInitializeSmokeTests"/>; see that file for the full
-/// MCP-D10/D11/Constraint-#5 rationale. This file deliberately uses generous
-/// CI-tolerant timeouts since the assertion is "exits within grace period",
-/// not the ~60ms observed locally.
-/// </para>
-/// </summary>
+/// <summary>Stdin EOF must exit 0 within the 5s watchdog grace period; allow 10s for slow CI, not the ~60ms seen locally. An open pipe must
+/// survive readiness plus ~2s idle. Uses the spawn/readiness/exe-resolution pattern from McpStdioInitializeSmokeTests.</summary>
 [Trait("Category", "Integration")]
 [Trait("Category", "RequiresHyperV")]
 [Collection("McpStdioServerSpawn")]
@@ -60,36 +39,6 @@ public class Issue87StdinEofShutdownTests
         {
             return false;
         }
-    }
-
-    private readonly record struct ServerExeLookup(bool Found, string? Path, IReadOnlyList<string> AttemptedPaths);
-
-    private static ServerExeLookup ResolveServerExePath()
-    {
-        var attempted = new List<string>();
-
-        var baseDir = AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-        var tfm = Path.GetFileName(baseDir);
-        var configDir = Path.GetDirectoryName(baseDir);
-        var config = configDir is null ? null : Path.GetFileName(configDir);
-        var binDir = configDir is null ? null : Path.GetDirectoryName(configDir);
-        var testProjDir = binDir is null ? null : Path.GetDirectoryName(binDir);
-        var testsRoot = testProjDir is null ? null : Path.GetDirectoryName(testProjDir);
-        var repoRoot = testsRoot is null ? null : Path.GetDirectoryName(testsRoot);
-
-        if (repoRoot is null || config is null)
-        {
-            attempted.Add($"<unable to derive repo root from AppContext.BaseDirectory='{AppContext.BaseDirectory}'>");
-            return new ServerExeLookup(false, null, attempted);
-        }
-
-        var candidate = Path.Combine(repoRoot, "src", "HyperV.Mcp.Server", "bin", config, tfm, "HyperV.Mcp.Server.exe");
-        attempted.Add(candidate);
-        if (File.Exists(candidate))
-        {
-            return new ServerExeLookup(true, candidate, attempted);
-        }
-        return new ServerExeLookup(false, null, attempted);
     }
 
     private sealed class SpawnedServer : IDisposable
@@ -168,16 +117,9 @@ public class Issue87StdinEofShutdownTests
             return (true, null);
         }
 
-        var lookup = ResolveServerExePath();
-        if (!lookup.Found || lookup.Path is null)
-        {
-            Assert.Fail(
-                $"Server exe not found at any candidate path. " +
-                $"Searched: {string.Join(", ", lookup.AttemptedPaths)}. " +
-                $"Run a Debug build of HyperV.Mcp.Server first.");
-        }
-        _output.WriteLine($"Server exe: {lookup.Path}");
-        return (false, lookup.Path);
+        var serverExe = TestPaths.ServerExecutablePath();
+        _output.WriteLine($"Server exe: {serverExe}");
+        return (false, serverExe);
     }
 
     [Fact(Timeout = 180_000)]
@@ -195,9 +137,7 @@ public class Issue87StdinEofShutdownTests
                 $"--- STDOUT ---\n{server.SnapshotStdout()}\n--- STDERR ---\n{server.SnapshotStderr()}");
         }
 
-        // Close stdin → SDK transport observes EOF → watchdog calls
-        // StopApplication() → process exits cleanly within grace period (5s).
-        // Allow 10s on slow CI.
+        // Allow 10s on slow CI for the 5s EOF shutdown grace period.
         try { server.Process.StandardInput.Close(); } catch { }
 
         var sw = Stopwatch.StartNew();
@@ -214,7 +154,6 @@ public class Issue87StdinEofShutdownTests
                 $"--- STDOUT ---\n{server.SnapshotStdout()}\n--- STDERR ---\n{server.SnapshotStderr()}");
         }
 
-        // Flush async readers.
         server.Process.WaitForExit();
         _output.WriteLine($"Server exited {sw.ElapsedMilliseconds} ms after stdin close (exit code {server.Process.ExitCode}).");
         server.Process.ExitCode.Should().Be(0,
@@ -237,8 +176,6 @@ public class Issue87StdinEofShutdownTests
                 $"--- STDOUT ---\n{server.SnapshotStdout()}\n--- STDERR ---\n{server.SnapshotStderr()}");
         }
 
-        // Hold stdin open and verify the server does NOT exit prematurely
-        // (i.e. the watchdog is correctly passive).
         await Task.Delay(2_000);
 
         server.Process.HasExited.Should().BeFalse(

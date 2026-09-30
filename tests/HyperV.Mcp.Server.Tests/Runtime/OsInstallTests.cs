@@ -229,6 +229,7 @@ public class OsInstallTests
                 "local", "test-vm", @"C:\ISOs\win11.iso", "P@ssw0rd!",
                 4, 8192, 127, null, "en-US", "Windows 11 Pro", null, 60,
                 It.IsAny<bool>(),
+                It.IsAny<string?>(),
                 It.IsAny<CancellationToken>()))
             .ReturnsAsync(expected);
 
@@ -251,6 +252,7 @@ public class OsInstallTests
             "local", "test-vm", @"C:\ISOs\win11.iso", "P@ssw0rd!",
             4, 8192, 127, null, "en-US", "Windows 11 Pro", null, 60,
             It.IsAny<bool>(),
+            It.IsAny<string?>(),
             It.IsAny<CancellationToken>()), Times.Once,
             "vm_os_install must delegate to IHyperVManager.OsInstallAsync with correct arguments");
     }
@@ -333,7 +335,7 @@ public class OsInstallTests
                 It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(),
                 1, It.IsAny<long>(), It.IsAny<int>(), It.IsAny<string?>(),
                 It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string?>(),
-                It.IsAny<int>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                It.IsAny<int>(), It.IsAny<bool>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
             .ThrowsAsync(new ArgumentException("Windows 11 requires minimum 2 vCPUs, got 1"));
 
         var dispatcher = CreateDispatcher();
@@ -365,7 +367,7 @@ public class OsInstallTests
                 It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(),
                 It.IsAny<int>(), 2048, It.IsAny<int>(), It.IsAny<string?>(),
                 It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string?>(),
-                It.IsAny<int>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                It.IsAny<int>(), It.IsAny<bool>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
             .ThrowsAsync(new ArgumentException("Windows 11 requires minimum 4096 MB RAM"));
 
         var dispatcher = CreateDispatcher();
@@ -397,7 +399,7 @@ public class OsInstallTests
                 It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(),
                 It.IsAny<int>(), It.IsAny<long>(), 32, It.IsAny<string?>(),
                 It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string?>(),
-                It.IsAny<int>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                It.IsAny<int>(), It.IsAny<bool>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
             .ThrowsAsync(new ArgumentException("Windows 11 requires minimum 64 GB disk"));
 
         var dispatcher = CreateDispatcher();
@@ -508,7 +510,7 @@ public class OsInstallTests
                 It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(),
                 It.IsAny<int>(), It.IsAny<long>(), It.IsAny<int>(), It.IsAny<string?>(),
                 It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string?>(),
-                It.IsAny<int>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                It.IsAny<int>(), It.IsAny<bool>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
             .ThrowsAsync(new IsoNotFoundException(@"C:\ISOs\missing.iso"));
 
         var dispatcher = CreateDispatcher();
@@ -538,7 +540,7 @@ public class OsInstallTests
                 It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(),
                 It.IsAny<int>(), It.IsAny<long>(), It.IsAny<int>(), It.IsAny<string?>(),
                 It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string?>(),
-                It.IsAny<int>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                It.IsAny<int>(), It.IsAny<bool>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
             .ThrowsAsync(new InstallTimeoutException(
                 "Installation timed out after 60 minutes", 60, "os-ready"));
 
@@ -569,7 +571,7 @@ public class OsInstallTests
                 It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(),
                 It.IsAny<int>(), It.IsAny<long>(), It.IsAny<int>(), It.IsAny<string?>(),
                 It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string?>(),
-                It.IsAny<int>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                It.IsAny<int>(), It.IsAny<bool>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
             .ThrowsAsync(new InstallFailedException(
                 "Bootstrap failed: PS Direct session unavailable",
                 vmId: "abc-123", vmName: "test-vm"));
@@ -602,7 +604,7 @@ public class OsInstallTests
                 It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(),
                 It.IsAny<int>(), It.IsAny<long>(), It.IsAny<int>(), It.IsAny<string?>(),
                 It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string?>(),
-                It.IsAny<int>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                It.IsAny<int>(), It.IsAny<bool>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
             .ThrowsAsync(new AutounattendFailedException(
                 "Failed to create autounattend ISO: oscdimg exit code 1"));
 

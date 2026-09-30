@@ -83,6 +83,21 @@ public class Issue97OsInstallValidationTests : IDisposable
         var m = new Mock<IIsoInspector>(MockBehavior.Strict);
         m.Setup(i => i.ContainsWindowsInstallWimWithDiagnosticAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync((found, diagnostic));
+        // Issue #208 / ISO-D22: on a not-Windows wim probe the classifier falls through to the casper
+        // probe before deciding Unsupported, so the strict mock must answer it (not-Ubuntu). Unused
+        // when found=true.
+        m.Setup(i => i.ContainsCasperLayoutWithDiagnosticAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((false, "no casper/ layout"));
+        // Issue #208 / ISO-D16.1: the classifier consults the fail-closed tri-state probes, not the
+        // (bool,diag) tuple, so the strict mock must answer them. found=true confirms Windows; casper
+        // is always NotConfirmed (these fixtures cover Windows / non-Windows, not the Ubuntu happy path).
+        m.Setup(i => i.ProbeWindowsInstallWimAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(found ? IsoMarkerProbeResult.Confirmed : IsoMarkerProbeResult.NotConfirmed);
+        m.Setup(i => i.ProbeCasperLayoutAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(IsoMarkerProbeResult.NotConfirmed);
+        // Issue #370 / UMD-D2: the classifier now reads Ubuntu media through the widened probe.
+        m.Setup(i => i.ProbeUbuntuMediaAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new UbuntuMediaProbe(IsoMarkerProbeResult.NotConfirmed, null));
         return m;
     }
 
