@@ -24,6 +24,7 @@
          does not touch it. See /myplans/remoting/linux-guest-support/linux-ssh-exec-first-slice-design.md. -->
     <!-- Pinned >=2026.0.0: first stable release patching GHSA-q939-rpr3-3284 (NU1903). -->
     <PackageReference Include="SSH.NET" Version="2026.0.0" />
+    <PackageReference Include="System.ServiceProcess.ServiceController" Version="10.0.12" />
   </ItemGroup>
 
   <ItemGroup>
