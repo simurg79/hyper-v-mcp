@@ -11,7 +11,7 @@ name: CI (Hyper-V)
 #   - Hyper-V role enabled (Get-VM available)
 #   - .NET 8 SDK installed (or installable)
 #   - PowerShell 7+ available
-#   - Lab fixtures per the operator-local vault doc internal documentation (not tracked in this repo)
+#   - Lab fixtures and credentials configured privately on the runner
 #
 # This workflow is intentionally NOT triggered on every PR. It runs:
 #   - Manually via workflow_dispatch

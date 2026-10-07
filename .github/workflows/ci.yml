@@ -44,6 +44,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Check public metadata
+        shell: pwsh
+        run: .\scripts\check-public-metadata.ps1
+
       - name: Setup .NET 8
         uses: actions/setup-dotnet@v5
         with:

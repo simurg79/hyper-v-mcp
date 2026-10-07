@@ -59,6 +59,20 @@ Use a short, kind-prefixed branch name:
 4. Describe the change, link any related issue, and note whether you ran the
    Hyper-V-dependent tests.
 
+## Public release checks
+
+Before publishing a release or opening a pull request, run:
+
+```powershell
+.\scripts\check-public-metadata.ps1
+```
+
+Project links must point to this public repository, and documentation locators
+must resolve to tracked public files. Keep private issue links, local design
+documents, personal checkout paths, credentials, and diagnostic artifacts out of
+release exports. Review the complete exported diff; the metadata check is not a
+general secret scanner. CI runs the same check before building.
+
 ## Coding conventions
 
 - Target framework is `net8.0-windows`; keep the server console-only.

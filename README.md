@@ -54,7 +54,7 @@ This MCP server enables AI agents (Roo, Claude Desktop, GitHub Copilot, Cursor, 
 | `vm_os_install` | Install OS from ISO image — fully automated, single call | 3 |
 | `vm_create_base_image` | Generalize an installed VM into a reusable base VHDX (sysprep + checkpoint-merge + copy) | 3 |
 
-> **Note on `vm_create` performance and timeout.** `vm_create` verifies the base VHDX with SHA-256 before and after the differencing clone (≈ 2 s/GB per pass on a cold page cache). A persisted `<base>.vhdx.sha256` sidecar collapses the pre-hash to a stat-tuple match on subsequent runs. The default server-side request envelope is **120 s**; override via `HYPERV_MCP_VM_CREATE_TIMEOUT_SECONDS` (range 60–600). Pass `verifyBaseImageHash: false` per call to skip the hash check entirely (see the tool description for the trade-off). The full env-var reference was relocated to the operator-local local documentation at `internal documentation` (not tracked in this repo).
+> **Note on `vm_create` performance and timeout.** `vm_create` verifies the base VHDX with SHA-256 before and after the differencing clone (≈ 2 s/GB per pass on a cold page cache). A persisted `<base>.vhdx.sha256` sidecar collapses the pre-hash to a stat-tuple match on subsequent runs. The default server-side request envelope is **120 s**; override via `HYPERV_MCP_VM_CREATE_TIMEOUT_SECONDS` (range 60–600). Pass `verifyBaseImageHash: false` per call to skip the hash check entirely (see the tool description for the trade-off).
 
 ### Guest-login readiness: `vm_wait_ready`
 
@@ -177,7 +177,7 @@ src/
 │   │   ├── ErrorCodes.cs
 │   │   └── (CommandResult, FileTransferResult, CheckpointResult, OsInstallResult, ImageInfo, VmInfo)
 │   └── Tools/
-│       └── VmTools.cs              ← single consolidated `[McpServerToolType]` with all 22 implemented tool wrappers (see internal documentation (internal reference))
+│       └── VmTools.cs              ← single consolidated `[McpServerToolType]` with all 22 implemented tool wrappers
 │
 tests/
 ├── HyperV.Mcp.Server.Tests/
@@ -187,20 +187,7 @@ tests/
 │   ├── Remoting/
 │   └── Runtime/
 
-local documentation                         ← Plan/design documents (24 markdown files; abbreviated below)
-├── design.md                          ← Top-level design document
-├── design-review.md                   ← Design review notes
-├── execution-plan.md
-├── phase1-manual-test-plan.md
-├── remoting/         …                ← Focus areas with per-component design docs
-├── vm-management/    …
-├── security/         …
-├── execution/        …
-├── operational/      …
-└── mcp-interface/    …
 ```
-
-> **Note:** `local documentation` in this repository is a local symlink/vault-backed location (the canonical plan content lives in an local documentation, not committed to this repo). The plan-document links elsewhere in this README resolve only in worktrees that have the `local documentation` symlink configured locally; on the GitHub web viewer or in plain clones without the vault set up, those links will not resolve.
 
 ## Installing an OS from ISO (`vm_os_install`)
 
@@ -240,7 +227,7 @@ This creates a 4-vCPU, 8 GB RAM, 127 GB disk Windows 11 Pro VM, installs the OS 
 - **Execution time**: ~8 minutes on typical hardware. This is a long-running operation.
 - **MCP client timeout**: Many MCP clients (including Roo Code) have a default tool call timeout of 60 seconds, which is far shorter than the ~8 minute installation. The tool will complete successfully on the server side regardless of client timeout. Configure your MCP client's timeout to ≥600 seconds if you want to receive the completion response. The same client-side cap applies to any tool whose server envelope exceeds 60 s — see the **Note on `vm_create` performance and timeout** above for `vm_create`'s specific knob.
 - **Product keys**: When no `productKey` is provided, the server uses a well-known Generic Volume License Key (GVLK) for the selected edition. These are Microsoft-published KMS client setup keys that allow installation without activation.
-- **Test VMs**: VMs created for live integration testing (e.g., `win11-mcp-test`) should be kept running. The single source of truth for lab credentials, env-var contract, VMs, and storage layout was relocated to the operator-local local documentation at `internal documentation` (not tracked in this repo). The test-suite README at [`tests/HyperV.Mcp.Server.Tests/README.md`](tests/HyperV.Mcp.Server.Tests/README.md) carries the same breadcrumb.
+- **Test VMs**: Configure lab VM identities, credentials, and storage privately. See the [test-suite README](tests/HyperV.Mcp.Server.Tests/README.md) for testing guidance.
 
 ### Installing Ubuntu Server 24.04
 
@@ -269,8 +256,6 @@ If an install still exceeds `timeoutMinutes`, the error message and its structur
 
 Either item is reported as undetermined rather than guessed when it cannot be read. Both survive credential sanitization.
 
-For the authoritative contract, see the ISO installation spec (internal reference) and the Ubuntu media capability & timeout diagnostics design (internal reference).
-
 ## Diagnostics
 
 For diagnosing PowerShell-related issues (PS Direct / WinRM script generation, credential handling, autoload failures), the server supports an opt-in **script-dump** mode that writes the exact `.ps1` handed to `pwsh` (with credentials masked) to a directory of your choosing and preserves the `%TEMP%` original for manual rerun.
@@ -290,13 +275,13 @@ $env:HYPERV_MCP_DUMP_PS_SCRIPTS = "C:\hvmcp-debug"
 - **OS-install scripts (`vm_os_install`) are excluded from dumping in v1** because the v1 masker cannot redact their variable-backed credentials and unattended-XML password nodes. Setting the env var has no effect for that one code path.
 - If the dump directory cannot be created, the server logs a Warning and behaves as if the feature were disabled for that call (the `%TEMP%` script is deleted as normal). If the directory exists but a write fails mid-run, the server logs a Warning and **preserves the `%TEMP%` script** so you can still rerun manually. Dump-side failures never affect the underlying tool call.
 
-See the Script-Dump Diagnostic Design (internal reference) for the full activation, masking, and security contract, including a recommended Windows ACL recipe for the dump directory. **Treat the dump directory as sensitive.** The `.gitignore` recommendation only applies if the dump directory is inside a repository checkout; for production diagnostic use, prefer a path **outside any repo** (e.g., `C:\hvmcp-debug` or `%TEMP%\hvmcp-debug`).
+**Treat the dump directory as sensitive and restrict its ACL to authorized operators.** The `.gitignore` recommendation only applies if the dump directory is inside a repository checkout; for production diagnostic use, prefer a path **outside any repo** (e.g., `C:\hvmcp-debug` or `%TEMP%\hvmcp-debug`).
 
 ## Known Issues
 
 | Issue | Detail | Workaround |
 |-------|--------|------------|
-| pwsh 7+ Hyper-V probe fails on Windows 11 26200+ | `Get-VM` throws "Value cannot be null" when spawned non-interactively in pwsh due to a WMI provider bug on recent Windows 11 Insider builds. The server detects this and falls back to `powershell.exe` 5.1 automatically. | No action needed — fallback is automatic. Tracked as #26 (internal reference). Will resolve when Microsoft fixes the WMI provider. |
+| pwsh 7+ Hyper-V probe fails on Windows 11 26200+ | `Get-VM` throws "Value cannot be null" when spawned non-interactively in pwsh due to a WMI provider bug on recent Windows 11 Insider builds. The server detects this and falls back to `powershell.exe` 5.1 automatically. | No action needed — fallback is automatic. Will resolve when Microsoft fixes the WMI provider. |
 
 ### Smoke startup failure: `Get-VMHost` probe `CommandNotFoundException: 'Select-Object'`
 
@@ -305,33 +290,13 @@ On a freshly-built server `bin/`, the post-build `StripBundledMicrosoftPowerShel
 The Core runspace then cannot resolve `Select-Object` because the only remaining copy on disk is the `Desktop`-edition module under `C:\Windows\System32\WindowsPowerShell\v1.0\`, which Core correctly refuses to load.
 **This is not an OS-version issue** — it reproduces on any host where the server is launched against a freshly-built, stripped `bin/`.
 
-**No end-user workaround.** The fix lives in the build target and is tracked in #66 (internal reference). (Developers can manually restore `Microsoft.PowerShell.Utility` to `bin\Debug\net8.0-windows\runtimes\win\lib\net8.0\Modules\` after each build, but this is fragile and not advisable.)
+**No end-user workaround.** The fix lives in the build target. (Developers can manually restore `Microsoft.PowerShell.Utility` to `bin\Debug\net8.0-windows\runtimes\win\lib\net8.0\Modules\` after each build, but this is fragile and not advisable.)
 
-> For operational failure modes (timeouts, partially-created resources, transient PowerShell faults), the troubleshooting guide was relocated to the operator-local local documentation at `internal documentation` (not tracked in this repo). This table tracks build/OS-level known issues only.
+## Documentation
 
-## Documentation Map
-
-All design memory, implementation plans, and architectural decisions live under the canonical `local documentation` root, which is **operator-local and not tracked in this repository** (`.gitignore` entry `local documentation`). The paths below are therefore locators for a configured developer workspace, deliberately rendered as plain paths rather than links so they do not present as dead links when browsing on GitHub.
-
-### Top-level
-
-- `internal documentation` — Hierarchy + conventions for the entire `local documentation` tree.
-- `internal documentation` — Full architecture: execution channels, bootstrap state machine, tool contracts, security model, MVP plan.
-- `internal documentation` — Review findings and enhancement recommendations.
-- `internal documentation` — Live MCP smoke procedure for the in-proc PowerShell SDK runspace + `SessionStore`. Appendix A indexes the LF-D7 Probe ladder #1 → #8 and the `diagVersion` v6 → v10 history.
-
-### Remoting focus area
-
-- `internal documentation` — REM-D1..REM-D7 (incl. REM-D7 = LF-D7 / RC-11.10 cure cross-reference).
-- `internal documentation` — PSD-D1..PSD-D10. **PSD-D9 / PSD-D10 are the LF-D7 cure** (`$PSDefaultParameterValues` injection, mirrored at runspace open and PSSession creation).
-- `internal documentation` — Full hypothesis ladder, falsified hypotheses preserved as durable evidence.
-- `internal documentation` — Root-cause analysis for the `Value cannot be null. Parameter name: name` family. Part B is the RC-11.10 cure narrative.
-- `internal documentation` — KEEP / RETIRE / DEFER for the 6 RC-1..RC-11.9 diagnostic seams.
-- `internal documentation` — SM-D1..SM-D8 (incl. SM-D8 = `SessionStore` mirror of the LF-D7 cure).
-
-### Diagnostics focus area
-
-- `internal documentation` — `vm_echo` / `vm_diag` tool surface, the `diagVersion` literal convention, and the smoke-gate convention (DIAG-D4 / DIAG-D5).
+- [Contributing and public release checks](CONTRIBUTING.md)
+- [Test-suite guidance](tests/HyperV.Mcp.Server.Tests/README.md)
+- [Security reporting](SECURITY.md)
 
 ## License
 

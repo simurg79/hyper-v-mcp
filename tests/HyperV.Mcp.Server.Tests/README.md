@@ -2,7 +2,7 @@
 
 ## Overview
 
-This test suite defines the **expected MCP behavior contract** for the Hyper-V MCP Server using a **test-first** approach. Tests are written _before_ implementation to codify the design decisions from the design documents (internal reference).
+This test suite defines the **expected MCP behavior contract** for the Hyper-V MCP Server using a **test-first** approach. Tests codify tool contracts, configuration defaults, and runtime behavior.
 
 ## Test Structure
 
@@ -74,43 +74,22 @@ Runtime tests exercise real implementations of `ToolDispatcher`, `HostResolver`,
 | `VmLifecycleFlowTests.cs` | Lifecycle orchestration flows | GREEN | Mocked (orchestration flow) |
 | `CheckpointFileTransferRemotingFlowTests.cs` | Checkpoint/file-transfer/remoting flows | GREEN | Mocked (orchestration flow) |
 
-## Key Design References
-
-| Test File | Primary Design Docs |
-|-----------|-------------------|
-| `ToolDiscoveryTests.cs` | internal documentation (internal reference) — Complete Tool Catalog |
-| `ErrorEnvelopeTests.cs` | internal documentation (internal reference) — MCP-D2, ADR-8, Error Code Taxonomy |
-| `RemotingContractTests.cs` | internal documentation (internal reference) — MCP-D3, Host Connection Configuration |
-| `ConcurrencyTests.cs` | internal documentation (internal reference) — CC-D1 through CC-D7 |
-| `ToolDispatchTests.cs` | internal documentation (internal reference) — MCP-D1, MCP-D6 |
-| `HostResolutionTests.cs` | internal documentation (internal reference) — Host Connection Configuration |
-| `ConcurrencyGateRuntimeTests.cs` | internal documentation (internal reference) — CC-D1 through CC-D4 |
-| `ErrorMappingRuntimeTests.cs` | internal documentation (internal reference) — MCP-D6, Error Code Taxonomy |
-| `TimeoutBehaviorTests.cs` | internal documentation (internal reference) — CMD-D4, ADR-9 |
-| `VmLifecycleFlowTests.cs` | internal documentation (internal reference) — Capability Matrix |
-| `CheckpointFileTransferRemotingFlowTests.cs` | internal documentation (internal reference), internal documentation (internal reference) |
-
 ## Conventions
 
 - All test classes include doc comments explaining _how to make tests pass_
-- Design doc links are included in assertion failure messages
+- Assertion failure messages explain the expected behavior
 - Tests use `FluentAssertions` for readable failure output
 - Runtime tests use `Moq` for mocking infrastructure dependencies
 - Tests are categorized with `[Trait("Category", "Runtime")]` for runtime tests
 - No real Hyper-V integration — all tests are deterministic unit tests
 
-## Live Test VM: win11-mcp-test
+## Live test environment
 
-A persistent Windows 11 25H2 VM created via `vm_os_install` for live
-end-to-end testing of MCP tools that require a running Windows guest
+Configure a dedicated test VM for live end-to-end testing of MCP tools that require a running Windows guest
 (`vm_run_command`, `vm_run_script`, `vm_copy_file`, `vm_get_file`,
 `vm_checkpoint`, `vm_status`, `vm_wait_ready`, lifecycle ops).
 
-> **Single source of truth.** Credentials, env-var contract, specs, switch,
-> and recreation instructions for `win11-mcp-test` were relocated to the
-> operator-local local documentation at `internal documentation`
-> (not tracked in this repo). Do **not** duplicate the credential or env-var
-> values into this README; refer there instead. The companion preflight was
-> relocated to `myscripts/smoke-test/_phase1-preflight.ps1` (also not tracked
-> in this repo), and the contract test that pins the env-var names is
-> [`Runtime/CredentialResolverContractTests.cs`](Runtime/CredentialResolverContractTests.cs).
+Keep credentials, VM identities, switch configuration, storage layout, and
+recreation instructions in private operator configuration, not in this
+repository. The credential environment-variable contract is tested in
+[`Runtime/CredentialResolverContractTests.cs`](Runtime/CredentialResolverContractTests.cs).
