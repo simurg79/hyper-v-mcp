@@ -28,7 +28,7 @@
     <!-- Supplies FakeTimeProvider so readiness cadence is asserted on the same injected clock
          production uses; a hand-rolled stub could not drive Task.Delay(TimeProvider). -->
     <PackageReference Include="Microsoft.Extensions.TimeProvider.Testing" Version="8.10.0" />
-    <PackageReference Include="System.ServiceProcess.ServiceController" Version="8.0.1" />
+    <PackageReference Include="System.ServiceProcess.ServiceController" Version="10.0.12" />
   </ItemGroup>
 
   <ItemGroup>
